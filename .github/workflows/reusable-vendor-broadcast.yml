@@ -1,0 +1,52 @@
+name: Reusable Vendor Broadcast Engine
+
+
+on:
+  workflow_call:
+    inputs:
+      subscribers_file:
+        description: 'Path to the file in the shared code repository that lists consumer repositories.'
+        required: false
+        type: string
+        default: '.github/subscribers.json'
+      event_type:
+        description: 'Name of the broadcast event.'
+        required: false
+        type: string
+        default: 'vendor-code-updated'
+    secrets:
+      ACCESS_TOKEN:
+        description: 'GitHub token with cross-repository dispatch permissions.'
+        required: true
+
+
+jobs:
+  dispatch_events:
+    runs-on: ubuntu-latest
+    steps:
+      - name: '📥 Checkout Shared Code Repository'
+        uses: actions/checkout@v4
+
+      - name: '🔊 Broadcast to Subscribers'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          CONFIG_FILE: ${{ inputs.subscribers_file }}
+          EVENT_TYPE: ${{ inputs.event_type }}
+        run: |
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ Error: Subscribers list not found at $CONFIG_FILE."
+            exit 1
+          fi
+
+          echo "⏳ Broadcasting '$EVENT_TYPE' to consumer repositories..."
+          
+          jq -r '.[]' "$CONFIG_FILE" | while read -r target_repo; do
+            echo "📤 Dispatching to $target_repo."
+          
+            # Send a repository dispatch event by using GitHub CLI
+            gh api \
+              --method POST \
+              -H 'Accept: application/vnd.github.v3+json' \
+              "/repos/$target_repo/dispatches" \
+              -f event_type="$EVENT_TYPE" || echo "⚠️ Failed to dispatch to $target_repo."
+          done

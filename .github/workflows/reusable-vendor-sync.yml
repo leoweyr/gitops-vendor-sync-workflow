@@ -1,0 +1,59 @@
+name: Reusable Vendor Sync Engine
+
+
+on:
+  workflow_call:
+    inputs:
+      vendor_config:
+        description: 'Path to the dependency declaration file in the consumer repository.'
+        required: false
+        type: string
+        default: '.github/vendor.json'
+    secrets:
+      ACCESS_TOKEN:
+        description: 'GitHub token with read access to the shared code repository and write access to the consumer repository.'
+        required: true
+
+
+jobs:
+  materialize_dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: '📥 Checkout Downstream Repo'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ACCESS_TOKEN }}
+          fetch-depth: 0
+
+      - name: '📂 Fetch and Vendor Files'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          CONFIG_FILE: ${{ inputs.vendor_config }}
+        run: |
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ Error: Vendor config not found at $CONFIG_FILE."
+            exit 1
+          fi
+
+          UPSTREAM_REPO=$(jq -r '.upstream_repo' "$CONFIG_FILE")
+          UPSTREAM_BRANCH=$(jq -r '.upstream_branch // "main"' "$CONFIG_FILE")
+
+          jq -c '.files[]' "$CONFIG_FILE" | while read -r item; do
+            SOURCE=$(echo "$item" | jq -r '.source')
+            TARGET=$(echo "$item" | jq -r '.target')
+          
+            mkdir -p "$(dirname "$TARGET")"
+            echo "Vendoring $SOURCE -> $TARGET"
+          
+            gh api \
+              -H 'Accept: application/vnd.github.v3.raw' \
+              "/repos/$UPSTREAM_REPO/contents/$SOURCE?ref=$UPSTREAM_BRANCH" \
+              > "$TARGET"
+          done
+
+      - name: '📝 Auto Commit Vendored Files'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(vendor): sync upstream dependencies'
+          branch: develop
+          file_pattern: '**/*'
