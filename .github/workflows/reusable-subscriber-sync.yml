@@ -1,0 +1,118 @@
+name: Reusable Subscription Target Sync Engine
+
+
+on:
+  workflow_call:
+    inputs:
+      subscribers_file:
+        description: 'Path to the consumer repository list file in the shared code repository root.'
+        required: false
+        type: string
+        default: 'gitops-subscribers.json'
+      subscription_action:
+        description: 'Subscription request action for this shared repository. Use add or remove.'
+        required: true
+        type: string
+      consumer_repository:
+        description: 'Consumer repository in owner/repo format requesting subscribe or unsubscribe.'
+        required: true
+        type: string
+      target_branch:
+        description: 'Branch that receives subscriber list updates.'
+        required: false
+        type: string
+        default: 'develop'
+    secrets:
+      ACCESS_TOKEN:
+        description: 'GitHub token with write access to the shared code repository.'
+        required: true
+
+
+jobs:
+  sync_subscription_target:
+    runs-on: ubuntu-latest
+    steps:
+      - name: '📥 Checkout Shared Code Repository'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ACCESS_TOKEN }}
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: '🛠️ Update Subscription Target List'
+        id: update_subscriber_list
+        env:
+          SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
+          SUBSCRIPTION_ACTION: ${{ inputs.subscription_action }}
+          CONSUMER_REPOSITORY: ${{ inputs.consumer_repository }}
+        run: |
+          echo "subscriber_changed=false" >> "$GITHUB_OUTPUT"
+
+          if [ "$SUBSCRIPTION_ACTION" != 'add' ] && [ "$SUBSCRIPTION_ACTION" != 'remove' ]; then
+            echo "❌ Error: subscription_action must be add or remove."
+            exit 1
+          fi
+
+          if ! [[ "$CONSUMER_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "❌ Error: consumer_repository must use owner/repo format."
+            exit 1
+          fi
+
+          if [ ! -f "$SUBSCRIBERS_FILE" ]; then
+            if [ "$SUBSCRIPTION_ACTION" = 'remove' ]; then
+              echo "✅ Subscriber list file does not exist, nothing to remove."
+              exit 0
+            fi
+          
+            echo '[]' > "$SUBSCRIBERS_FILE"
+          fi
+
+          if ! jq -e 'type == "array"' "$SUBSCRIBERS_FILE" >/dev/null; then
+            echo "❌ Error: Subscriber list file must be a JSON array."
+            exit 1
+          fi
+
+          EXISTS=$(jq -r --arg repo "$CONSUMER_REPOSITORY" 'index($repo) != null' "$SUBSCRIBERS_FILE")
+
+          TMP_FILE=$(mktemp)
+          
+          if [ "$SUBSCRIPTION_ACTION" = 'add' ]; then
+            if [ "$EXISTS" = 'true' ]; then
+              echo "✅ Subscriber already exists, nothing to add."
+              rm -f "$TMP_FILE"
+              exit 0
+            fi
+          
+            jq --arg repo "$CONSUMER_REPOSITORY" '. + [$repo]' "$SUBSCRIBERS_FILE" > "$TMP_FILE"
+          else
+            if [ "$EXISTS" != 'true' ]; then
+              echo "✅ Subscriber does not exist, nothing to remove."
+              rm -f "$TMP_FILE"
+              exit 0
+            fi
+          
+            jq --arg repo "$CONSUMER_REPOSITORY" 'map(select(. != $repo))' "$SUBSCRIBERS_FILE" > "$TMP_FILE"
+          fi
+
+          mv "$TMP_FILE" "$SUBSCRIBERS_FILE"
+          echo "subscriber_changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: '📝 Commit Subscriber Update'
+        if: ${{ steps.update_subscriber_list.outputs.subscriber_changed == 'true' }}
+        env:
+          SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
+          SUBSCRIPTION_ACTION: ${{ inputs.subscription_action }}
+          CONSUMER_REPOSITORY: ${{ inputs.consumer_repository }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          if git diff --quiet -- "$SUBSCRIBERS_FILE"; then
+            echo "✅ Subscriber list is already up to date."
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git add -- "$SUBSCRIBERS_FILE"
+          git commit -m "ci(vendor-broadcast): $SUBSCRIPTION_ACTION $CONSUMER_REPOSITORY subscriber"
+          git push origin "HEAD:$TARGET_BRANCH"

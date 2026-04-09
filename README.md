@@ -13,7 +13,7 @@ Use this project on your **shared code repository** to publish versioned shared 
 
 1. Copy `.github/workflows/vendor-broadcast.yml` into your shared code repository.
 2. Add `gitops-shared.json` at repository root.
-3. Add `.github/subscribers.json` to declare consumer repositories.
+3. Add `gitops-subscribers.json` at repository root to declare consumer repositories.
 
 `gitops-shared.json` example:
 ```json
@@ -31,7 +31,7 @@ Use this project on your **shared code repository** to publish versioned shared 
 ]
 ```
 
-`.github/subscribers.json` (consumer repository list) example:
+`gitops-subscribers.json` (consumer repository list) example:
 ```json
 [
   "your-org/consumer-repo-a",
@@ -47,8 +47,7 @@ Tag-driven publish flow:
    ```
    
 2. If the `id` exists and the version is new, `gitops-shared.json` is updated idempotently.
-
-4. Then dispatches to all subscribers.
+3. Then dispatches to all consumer repositories listed in `gitops-subscribers.json`.
 
 ## 📥 Consumer Repository Usage
 
@@ -86,3 +85,10 @@ Use this project on each **consumer repository** to pull shared codes by id with
 For each dependency id, the workflow selects the highest available version that satisfies the configured range.
 
 `target_dir` means the destination directory inside the current consumer repository where the shared code file is synchronized.
+
+When `shared_repo` in `gitops-vendor.json` changes, `vendor-sync.yml` automatically synchronizes subscription state for your consumer repository:
+
+- It unsubscribes from the previous shared repository (if one exists).
+- It subscribes to the new shared repository.
+
+You only need to update `shared_repo`, subscribe and unsubscribe operations are handled automatically.

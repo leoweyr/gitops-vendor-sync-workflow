@@ -5,10 +5,10 @@ on:
   workflow_call:
     inputs:
       subscribers_file:
-        description: 'Path to the file in the shared code repository that lists consumer repositories.'
+        description: 'Path to the consumer repository list file in the shared code repository.'
         required: false
         type: string
-        default: '.github/subscribers.json'
+        default: 'gitops-subscribers.json'
       shared_config:
         description: 'Path to the shared code manifest in the shared code repository.'
         required: false
