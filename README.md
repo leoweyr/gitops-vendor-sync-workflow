@@ -1,4 +1,4 @@
-# GitOps Vendor Sync Workflow
+![gitops-vendor-sync-workflow](https://socialify.git.ci/leoweyr/gitops-vendor-sync-workflow/image?description=1&font=KoHo&forks=1&issues=1&logo=https%3A%2F%2Fraw.githubusercontent.com%2Fleoweyr%2Fgitops-vendor-sync-workflow%2Frefs%2Fheads%2Fdevelop%2Fassets%2Ficon.svg&name=1&owner=1&pattern=Formal+Invitation&pulls=1&stargazers=1&theme=Light)
 
 ![Usage](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fabacus.jasoncameron.dev%2Fget%2Fleoweyr%2Fgitops-vendor-sync-workflow-usage&query=%24.value&label=Usage&color=blue&suffix=%20times)
 
