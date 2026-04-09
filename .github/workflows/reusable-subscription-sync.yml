@@ -68,24 +68,42 @@ jobs:
     if: ${{ needs.detect_shared_repo_change.outputs.shared_repo_changed == 'true' && needs.detect_shared_repo_change.outputs.old_shared_repo != '' }}
     needs:
       - detect_shared_repo_change
-    uses: ${{ needs.detect_shared_repo_change.outputs.old_shared_repo }}/.github/workflows/vendor-broadcast.yml@develop
-    with:
-      subscriber_action: 'remove'
-      subscriber_repository: ${{ github.repository }}
-      subscribers_file: ${{ inputs.subscribers_file }}
-      target_branch: ${{ inputs.target_branch }}
-    secrets:
-      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: '🛠️ Dispatch Unsubscribe Request'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          TARGET_SHARED_REPO: ${{ needs.detect_shared_repo_change.outputs.old_shared_repo }}
+          SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$TARGET_SHARED_REPO/actions/workflows/vendor-broadcast.yml/dispatches" \
+            -f ref="$TARGET_BRANCH" \
+            -f "inputs[subscriber_action]=remove" \
+            -f "inputs[subscriber_repository]=${{ github.repository }}" \
+            -f "inputs[subscribers_file]=$SUBSCRIBERS_FILE" \
+            -f "inputs[target_branch]=$TARGET_BRANCH"
 
   add_subscriber_to_new_shared_repo:
     if: ${{ needs.detect_shared_repo_change.outputs.shared_repo_changed == 'true' && needs.detect_shared_repo_change.outputs.new_shared_repo != '' }}
     needs:
       - detect_shared_repo_change
-    uses: ${{ needs.detect_shared_repo_change.outputs.new_shared_repo }}/.github/workflows/vendor-broadcast.yml@develop
-    with:
-      subscriber_action: 'add'
-      subscriber_repository: ${{ github.repository }}
-      subscribers_file: ${{ inputs.subscribers_file }}
-      target_branch: ${{ inputs.target_branch }}
-    secrets:
-      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: '🛠️ Dispatch Subscribe Request'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          TARGET_SHARED_REPO: ${{ needs.detect_shared_repo_change.outputs.new_shared_repo }}
+          SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$TARGET_SHARED_REPO/actions/workflows/vendor-broadcast.yml/dispatches" \
+            -f ref="$TARGET_BRANCH" \
+            -f "inputs[subscriber_action]=add" \
+            -f "inputs[subscriber_repository]=${{ github.repository }}" \
+            -f "inputs[subscribers_file]=$SUBSCRIBERS_FILE" \
+            -f "inputs[target_branch]=$TARGET_BRANCH"
