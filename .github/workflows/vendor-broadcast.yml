@@ -5,13 +5,26 @@ on:
   push:
     branches:
       - develop
+    tags:
+      - 'shared/*/v*'
     paths:
       - 'gitops-shared.json'
       - '.github/subscribers.json'
 
 
 jobs:
+  update_shared_manifest:
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-shared-manifest-update.yml@develop
+    with:
+      shared_config: 'gitops-shared.json'
+      shared_tag: ${{ github.ref_name }}
+      target_branch: 'develop'
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+
   call_vendor_broadcast:
+    needs:
+      - update_shared_manifest
     uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-broadcast.yml@develop
     with:
       subscribers_file: '.github/subscribers.json'
