@@ -37,6 +37,11 @@ jobs:
       old_shared_repo: ${{ steps.detect.outputs.old_shared_repo }}
       new_shared_repo: ${{ steps.detect.outputs.new_shared_repo }}
     steps:
+      - name: 👣 Track Workflow Run
+        continue-on-error: true
+        run: |
+          curl -s "https://abacus.jasoncameron.dev/hit/leoweyr/gitops-vendor-sync-workflow-usage" > /dev/null
+
       - name: '📥 Checkout Consumer Repository'
         uses: actions/checkout@v4
         with:

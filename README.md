@@ -1,5 +1,7 @@
 # GitOps Vendor Sync Workflow
 
+![Usage](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fabacus.jasoncameron.dev%2Fget%2Fleoweyr%2Fgitops-vendor-sync-workflow-usage&query=%24.value&label=Usage&color=blue&suffix=%20times)
+
 > [!IMPORTANT]
 >
 > The `ACCESS_TOKEN` (GitHub Token) secret must have enough permissions for:

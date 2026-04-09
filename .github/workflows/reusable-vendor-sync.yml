@@ -19,6 +19,11 @@ jobs:
   materialize_dependencies:
     runs-on: ubuntu-latest
     steps:
+      - name: 👣 Track Workflow Run
+        continue-on-error: true
+        run: |
+          curl -s "https://abacus.jasoncameron.dev/hit/leoweyr/gitops-vendor-sync-workflow-usage" > /dev/null
+
       - name: '📥 Checkout Downstream Repo'
         uses: actions/checkout@v4
         with:
