@@ -1,0 +1,21 @@
+name: Vendor Broadcast
+
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - 'gitops-shared.json'
+      - '.github/subscribers.json'
+
+
+jobs:
+  call_vendor_broadcast:
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-broadcast.yml@develop
+    with:
+      subscribers_file: '.github/subscribers.json'
+      shared_config: 'gitops-shared.json'
+      event_type: 'vendor-code-updated'
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
