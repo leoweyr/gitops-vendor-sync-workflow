@@ -110,7 +110,9 @@ jobs:
           CONSUMER_REPOSITORY: ${{ inputs.consumer_repository }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
-          if git diff --quiet -- "$SUBSCRIBERS_FILE"; then
+          git add -- "$SUBSCRIBERS_FILE"
+
+          if git diff --cached --quiet -- "$SUBSCRIBERS_FILE"; then
             echo "✅ Subscriber list is already up to date."
             exit 0
           fi
@@ -118,6 +120,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          git add -- "$SUBSCRIBERS_FILE"
           git commit -m "ci(vendor-broadcast): $SUBSCRIPTION_ACTION $CONSUMER_REPOSITORY subscriber"
           git push origin "HEAD:$TARGET_BRANCH"
