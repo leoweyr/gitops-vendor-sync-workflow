@@ -1,0 +1,377 @@
+name: Reusable Vendor Sync Engine
+
+
+on:
+  workflow_call:
+    inputs:
+      vendor_config:
+        description: 'Path to the dependency manifest in the consumer repository.'
+        required: false
+        type: string
+        default: 'gitops-vendor.json'
+    secrets:
+      ACCESS_TOKEN:
+        description: 'GitHub token with read access to the shared code repository and write access to the consumer repository.'
+        required: true
+
+
+jobs:
+  materialize_dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 👣 Track Workflow Run
+        continue-on-error: true
+        run: |
+          curl -s "https://abacus.jasoncameron.dev/hit/leoweyr/gitops-vendor-sync-workflow-usage" > /dev/null
+
+      - name: '📥 Checkout Downstream Repo'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ACCESS_TOKEN }}
+          fetch-depth: 0
+
+      - name: '📂 Fetch and Vendor Files'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          CONFIG_FILE: ${{ inputs.vendor_config }}
+        run: |
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ Error: Vendor config not found at $CONFIG_FILE."
+            exit 1
+          fi
+
+          if ! jq -e '.dependencies | type == "array"' "$CONFIG_FILE" >/dev/null; then
+            echo "❌ Error: Vendor config must define a dependencies array."
+            exit 1
+          fi
+
+          SHARED_REPO=$(jq -r '.shared_repo // .upstream_repo // empty' "$CONFIG_FILE")
+          SHARED_MANIFEST_REF=$(jq -r '.shared_manifest_ref // "main"' "$CONFIG_FILE")
+          SHARED_CONFIG_PATH='gitops-shared.json'
+
+          if [ -z "$SHARED_REPO" ]; then
+            echo "❌ Error: shared_repo (or legacy upstream_repo) is required in $CONFIG_FILE."
+            exit 1
+          fi
+
+          SHARED_CONFIG_TMP=$(mktemp)
+          trap 'rm -f "$SHARED_CONFIG_TMP"' EXIT
+
+          if ! gh api \
+            -H 'Accept: application/vnd.github.v3.raw' \
+            "/repos/$SHARED_REPO/contents/$SHARED_CONFIG_PATH?ref=$SHARED_MANIFEST_REF" \
+            > "$SHARED_CONFIG_TMP"; then
+            echo "❌ Error: Failed to download shared config from $SHARED_REPO at $SHARED_CONFIG_PATH (ref: $SHARED_MANIFEST_REF)."
+            exit 1
+          fi
+
+          if ! jq -e 'type == "array"' "$SHARED_CONFIG_TMP" >/dev/null; then
+            echo "❌ Error: Shared config must be a JSON array."
+            exit 1
+          fi
+
+          LOCK_FILE='gitops-vendor-lock.json'
+          if [ ! -f "$LOCK_FILE" ]; then
+            echo '{}' > "$LOCK_FILE"
+          fi
+
+          if ! jq -e 'type == "object"' "$LOCK_FILE" >/dev/null; then
+            echo "❌ Error: Lock file must be a JSON object at $LOCK_FILE."
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          COMMITS_CREATED=0
+
+          normalize_semver() {
+            local raw="$1"
+          
+            if [[ "$raw" =~ ^([\^~])v(.+)$ ]]; then
+              echo "${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+            else
+              echo "${raw#v}"
+            fi
+          }
+
+          parse_semver() {
+            local normalized cleaned
+            normalized=$(normalize_semver "$1")
+            cleaned="${normalized%%-*}"
+            cleaned="${cleaned%%+*}"
+          
+            if [[ "$cleaned" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+            else
+              return 1
+            fi
+          }
+
+          semver_cmp() {
+            local a_major a_minor a_patch b_major b_minor b_patch
+            read -r a_major a_minor a_patch <<< "$(parse_semver "$1")" || return 1
+            read -r b_major b_minor b_patch <<< "$(parse_semver "$2")" || return 1
+
+            if [ "$a_major" -gt "$b_major" ]; then
+              echo 1
+              return
+            fi
+          
+            if [ "$a_major" -lt "$b_major" ]; then
+              echo -1
+              return
+            fi
+          
+            if [ "$a_minor" -gt "$b_minor" ]; then
+              echo 1
+              return
+            fi
+          
+            if [ "$a_minor" -lt "$b_minor" ]; then
+              echo -1
+              return
+            fi
+          
+            if [ "$a_patch" -gt "$b_patch" ]; then
+              echo 1
+              return
+            fi
+          
+            if [ "$a_patch" -lt "$b_patch" ]; then
+              echo -1
+              return
+            fi
+          
+            echo 0
+          }
+
+          semver_ge() {
+            local cmp
+            cmp=$(semver_cmp "$1" "$2") || return 1
+            [ "$cmp" -ge 0 ]
+          }
+
+          semver_gt() {
+            local cmp
+            cmp=$(semver_cmp "$1" "$2") || return 1
+            [ "$cmp" -gt 0 ]
+          }
+
+          semver_lt() {
+            local cmp
+            cmp=$(semver_cmp "$1" "$2") || return 1
+            [ "$cmp" -lt 0 ]
+          }
+
+          version_satisfies_range() {
+            local version range normalized_version normalized_range
+            local major minor patch lower upper
+
+            version="$1"
+            range="$2"
+            normalized_version=$(normalize_semver "$version")
+            normalized_range=$(normalize_semver "$range")
+
+            if ! parse_semver "$normalized_version" >/dev/null; then
+              return 1
+            fi
+
+            case "$normalized_range" in
+              ^*)
+                base="${normalized_range#^}"
+                read -r major minor patch <<< "$(parse_semver "$base")" || return 1
+                lower="$major.$minor.$patch"
+          
+                if [ "$major" -gt 0 ]; then
+                  upper="$((major + 1)).0.0"
+                elif [ "$minor" -gt 0 ]; then
+                  upper="0.$((minor + 1)).0"
+                else
+                  upper="0.0.$((patch + 1))"
+                fi
+          
+                semver_ge "$normalized_version" "$lower" && semver_lt "$normalized_version" "$upper"
+                ;;
+              ~*)
+                base="${normalized_range#~}"
+                read -r major minor patch <<< "$(parse_semver "$base")" || return 1
+                lower="$major.$minor.$patch"
+                upper="$major.$((minor + 1)).0"
+                semver_ge "$normalized_version" "$lower" && semver_lt "$normalized_version" "$upper"
+                ;;
+              *.[xX])
+          
+                if [[ "$normalized_range" =~ ^([0-9]+)\.([0-9]+)\.[xX]$ ]]; then
+                  major="${BASH_REMATCH[1]}"
+                  minor="${BASH_REMATCH[2]}"
+                  lower="$major.$minor.0"
+                  upper="$major.$((minor + 1)).0"
+                elif [[ "$normalized_range" =~ ^([0-9]+)\.[xX]$ ]]; then
+                  major="${BASH_REMATCH[1]}"
+                  lower="$major.0.0"
+                  upper="$((major + 1)).0.0"
+                else
+                  return 1
+                fi
+          
+                semver_ge "$normalized_version" "$lower" && semver_lt "$normalized_version" "$upper"
+                ;;
+              *)
+          
+                if [[ "$normalized_range" =~ ^([0-9]+)$ ]]; then
+                  major="${BASH_REMATCH[1]}"
+                  lower="$major.0.0"
+                  upper="$((major + 1)).0.0"
+                  semver_ge "$normalized_version" "$lower" && semver_lt "$normalized_version" "$upper"
+                elif [[ "$normalized_range" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+                  major="${BASH_REMATCH[1]}"
+                  minor="${BASH_REMATCH[2]}"
+                  lower="$major.$minor.0"
+                  upper="$major.$((minor + 1)).0"
+                  semver_ge "$normalized_version" "$lower" && semver_lt "$normalized_version" "$upper"
+                else
+                  read -r major minor patch <<< "$(parse_semver "$normalized_range")" || return 1
+                  [ "$normalized_version" = "$major.$minor.$patch" ]
+                fi
+                ;;
+            esac
+          }
+
+          while read -r item; do
+            ITEM_ID=$(echo "$item" | jq -r '.id // empty')
+            ITEM_RANGE=$(echo "$item" | jq -r '.version // empty')
+            ITEM_TARGET_DIR=$(echo "$item" | jq -r '.target_dir // empty')
+            LEGACY_TARGET=$(echo "$item" | jq -r '.target // empty')
+
+            if [ -z "$ITEM_ID" ] || [ -z "$ITEM_RANGE" ]; then
+              echo "❌ Error: Each dependencies item must define id and version."
+              exit 1
+            fi
+
+            CANDIDATES=$(jq -c --arg id "$ITEM_ID" '
+              [
+                .[] | select(.id == $id) as $f |
+                if (($f.versions // null) | type) == "array" then
+                  $f.versions[] | {
+                    version: .version,
+                    source: (.source // $f.source // empty),
+                    ref: (.ref // $f.ref // empty)
+                  }
+                else
+                  {
+                    version: ($f.version // empty),
+                    source: ($f.source // empty),
+                    ref: ($f.ref // empty)
+                  }
+                end
+              ] | map(select(.version != "" and .source != ""))
+            ' "$SHARED_CONFIG_TMP")
+
+            if [ "$(echo "$CANDIDATES" | jq 'length')" -eq 0 ]; then
+              echo "❌ Error: No shared code item found for id '$ITEM_ID'."
+              exit 1
+            fi
+
+            MATCHED_VERSION=''
+            MATCHED_SOURCE=''
+            MATCHED_REF=''
+
+            while IFS= read -r candidate; do
+              CANDIDATE_VERSION=$(echo "$candidate" | jq -r '.version')
+              CANDIDATE_SOURCE=$(echo "$candidate" | jq -r '.source')
+              CANDIDATE_REF=$(echo "$candidate" | jq -r '.ref // empty')
+
+              if version_satisfies_range "$CANDIDATE_VERSION" "$ITEM_RANGE"; then
+                if [ -z "$MATCHED_VERSION" ] || semver_gt "$CANDIDATE_VERSION" "$MATCHED_VERSION"; then
+                  MATCHED_VERSION="$CANDIDATE_VERSION"
+                  MATCHED_SOURCE="$CANDIDATE_SOURCE"
+                  MATCHED_REF="$CANDIDATE_REF"
+                fi
+              fi
+            done <<< "$(echo "$CANDIDATES" | jq -c '.[]')"
+
+            if [ -z "$MATCHED_VERSION" ]; then
+              echo "⏳ No compatible version found for id '$ITEM_ID' with range '$ITEM_RANGE'."
+              continue
+            fi
+
+            if [ -n "$ITEM_TARGET_DIR" ]; then
+              mkdir -p "$ITEM_TARGET_DIR"
+              TARGET_PATH="${ITEM_TARGET_DIR%/}/$(basename "$MATCHED_SOURCE")"
+            elif [ -n "$LEGACY_TARGET" ]; then
+              mkdir -p "$(dirname "$LEGACY_TARGET")"
+              TARGET_PATH="$LEGACY_TARGET"
+            else
+              echo "❌ Error: Each dependencies item must define target_dir (or legacy target)."
+              exit 1
+            fi
+
+            EFFECTIVE_REF="$SHARED_MANIFEST_REF"
+            if [ -n "$MATCHED_REF" ]; then
+              EFFECTIVE_REF="$MATCHED_REF"
+            fi
+
+            HAS_PREVIOUS=$(jq -r --arg id "$ITEM_ID" 'has($id)' "$LOCK_FILE")
+            OLD_VERSION=''
+          
+            if [ "$HAS_PREVIOUS" = 'true' ]; then
+              OLD_VERSION=$(jq -r --arg id "$ITEM_ID" '.[$id].version // empty' "$LOCK_FILE")
+              OLD_VERSION=$(normalize_semver "$OLD_VERSION")
+            fi
+          
+            NEW_VERSION=$(normalize_semver "$MATCHED_VERSION")
+
+            echo "📂 Vendoring $ITEM_ID@$NEW_VERSION from $MATCHED_SOURCE to $TARGET_PATH."
+
+            if ! gh api \
+              -H 'Accept: application/vnd.github.v3.raw' \
+              "/repos/$SHARED_REPO/contents/$MATCHED_SOURCE?ref=$EFFECTIVE_REF" \
+              > "$TARGET_PATH"; then
+              echo "❌ Error: Failed to fetch $MATCHED_SOURCE (id: $ITEM_ID, version: $MATCHED_VERSION)."
+              exit 1
+            fi
+
+            LOCK_TMP=$(mktemp)
+          
+            if ! jq \
+              --arg id "$ITEM_ID" \
+              --arg version "$NEW_VERSION" \
+              --arg path "$TARGET_PATH" \
+              '.[$id] = { version: $version, path: $path }' \
+              "$LOCK_FILE" > "$LOCK_TMP"; then
+              echo "❌ Error: Failed to update lock file for id '$ITEM_ID'."
+              rm -f "$LOCK_TMP"
+              exit 1
+            fi
+          
+            mv "$LOCK_TMP" "$LOCK_FILE"
+
+            git add -- "$TARGET_PATH" "$LOCK_FILE"
+
+            if git diff --cached --quiet -- "$TARGET_PATH" "$LOCK_FILE"; then
+              echo "✅ No file changes detected for id '$ITEM_ID'."
+              continue
+            fi
+
+            if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+              echo "❌ Error: Detected file changes for id '$ITEM_ID' without a version change."
+              exit 1
+            fi
+
+            if [ "$HAS_PREVIOUS" = 'true' ]; then
+              COMMIT_MESSAGE="chore(deps): bump $ITEM_ID from $OLD_VERSION to $NEW_VERSION"
+            else
+              COMMIT_MESSAGE="chore(deps): add $ITEM_ID $NEW_VERSION"
+            fi
+
+            git commit -m "$COMMIT_MESSAGE"
+            COMMITS_CREATED=$((COMMITS_CREATED + 1))
+          
+          done < <(jq -c '.dependencies[]' "$CONFIG_FILE")
+
+          if [ "$COMMITS_CREATED" -gt 0 ]; then
+            echo "🚀 Pushing $COMMITS_CREATED dependency commit(s) to develop."
+            git push origin HEAD:develop
+          else
+            echo "✅ No dependency updates detected."
+          fi

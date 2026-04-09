@@ -1,0 +1,41 @@
+name: Vendor Sync
+
+
+on:
+  push:
+    paths:
+      - 'gitops-vendor.json'
+  repository_dispatch:
+    types:
+      - vendor-code-updated
+
+
+jobs:
+  sync_subscription:
+    if: ${{ github.event_name == 'push' }}
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-subscription-sync.yml@develop
+    with:
+      vendor_config: 'gitops-vendor.json'
+      before_sha: ${{ github.event.before }}
+      subscribers_file: 'gitops-subscribers.json'
+      target_branch: 'develop'
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+
+  call_vendor_sync:
+    if: ${{ github.event_name == 'push' }}
+    needs:
+      - sync_subscription
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-sync.yml@develop
+    with:
+      vendor_config: 'gitops-vendor.json'
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+
+  call_vendor_sync_from_dispatch:
+    if: ${{ github.event_name == 'repository_dispatch' }}
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-sync.yml@develop
+    with:
+      vendor_config: 'gitops-vendor.json'
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}

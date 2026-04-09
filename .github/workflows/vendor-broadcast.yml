@@ -1,0 +1,70 @@
+name: Vendor Broadcast
+
+
+on:
+  push:
+    branches:
+      - develop
+    tags:
+      - 'shared/*/v*'
+    paths:
+      - 'gitops-shared.json'
+      - 'gitops-subscribers.json'
+  workflow_dispatch:
+    inputs:
+      subscriber_action:
+        description: 'Subscription action for the consumer repository. Use add or remove.'
+        required: false
+        type: string
+      subscriber_repository:
+        description: 'Consumer repository in owner/repo format to add or remove.'
+        required: false
+        type: string
+      subscribers_file:
+        description: 'Path to the consumer repository list file in the shared code repository root.'
+        required: false
+        type: string
+        default: 'gitops-subscribers.json'
+      target_branch:
+        description: 'Branch that receives subscriber list updates.'
+        required: false
+        type: string
+        default: 'develop'
+
+
+jobs:
+  sync_subscriber:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.subscriber_action != '' }}
+    concurrency:
+      group: 'shared-code-repo-subscriber-sync-${{ github.repository }}'
+      cancel-in-progress: false
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-subscriber-sync.yml@develop
+    with:
+      subscribers_file: ${{ github.event.inputs.subscribers_file || 'gitops-subscribers.json' }}
+      subscription_action: ${{ github.event.inputs.subscriber_action }}
+      consumer_repository: ${{ github.event.inputs.subscriber_repository }}
+      target_branch: ${{ github.event.inputs.target_branch || 'develop' }}
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+
+  update_shared_manifest:
+    if: ${{ github.event_name == 'push' }}
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-shared-manifest-update.yml@develop
+    with:
+      shared_config: 'gitops-shared.json'
+      shared_tag: ${{ github.ref_name }}
+      target_branch: 'develop'
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+
+  call_vendor_broadcast:
+    if: ${{ github.event_name == 'push' }}
+    needs:
+      - update_shared_manifest
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-broadcast.yml@develop
+    with:
+      subscribers_file: 'gitops-subscribers.json'
+      shared_config: 'gitops-shared.json'
+      event_type: 'vendor-code-updated'
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}

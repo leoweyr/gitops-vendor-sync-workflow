@@ -1,0 +1,82 @@
+name: Reusable Vendor Broadcast Engine
+
+
+on:
+  workflow_call:
+    inputs:
+      subscribers_file:
+        description: 'Path to the consumer repository list file in the shared code repository.'
+        required: false
+        type: string
+        default: 'gitops-subscribers.json'
+      shared_config:
+        description: 'Path to the shared code manifest in the shared code repository.'
+        required: false
+        type: string
+        default: 'gitops-shared.json'
+      event_type:
+        description: 'Name of the broadcast event.'
+        required: false
+        type: string
+        default: 'vendor-code-updated'
+    secrets:
+      ACCESS_TOKEN:
+        description: 'GitHub token with cross-repository dispatch permissions.'
+        required: true
+
+
+jobs:
+  dispatch_events:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 👣 Track Workflow Run
+        continue-on-error: true
+        run: |
+          curl -s "https://abacus.jasoncameron.dev/hit/leoweyr/gitops-vendor-sync-workflow-usage" > /dev/null
+
+      - name: '📥 Checkout Shared Code Repository'
+        uses: actions/checkout@v4
+
+      - name: '🔊 Broadcast to Subscribers'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          CONFIG_FILE: ${{ inputs.subscribers_file }}
+          SHARED_CONFIG_FILE: ${{ inputs.shared_config }}
+          EVENT_TYPE: ${{ inputs.event_type }}
+        run: |
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ Error: Subscribers list not found at $CONFIG_FILE."
+            exit 1
+          fi
+
+          if ! jq -e 'type == "array"' "$CONFIG_FILE" >/dev/null; then
+            echo "❌ Error: Subscribers file must be a JSON array."
+            exit 1
+          fi
+
+          if [ ! -f "$SHARED_CONFIG_FILE" ]; then
+            echo "❌ Error: Shared config not found at $SHARED_CONFIG_FILE."
+            exit 1
+          fi
+
+          if ! jq -e 'type == "array"' "$SHARED_CONFIG_FILE" >/dev/null; then
+            echo "❌ Error: Shared config must be a JSON array."
+            exit 1
+          fi
+
+          echo "⏳ Broadcasting '$EVENT_TYPE' to consumer repositories..."
+          
+          jq -r '.[]' "$CONFIG_FILE" | while read -r target_repo; do
+            echo "📤 Dispatching to $target_repo."
+          
+            # Send a repository dispatch event by using GitHub CLI
+            gh api \
+              --method POST \
+              -H 'Accept: application/vnd.github.v3+json' \
+              "/repos/$target_repo/dispatches" \
+              -f event_type="$EVENT_TYPE" \
+              -f client_payload[shared_manifest_path]="$SHARED_CONFIG_FILE" \
+              -f client_payload[shared_manifest_ref]="$GITHUB_SHA" \
+              -f client_payload[shared_repository]="$GITHUB_REPOSITORY" \
+              -f client_payload[shared_revision]="$GITHUB_SHA" || echo "⚠️ Failed to dispatch to $target_repo."
+          done

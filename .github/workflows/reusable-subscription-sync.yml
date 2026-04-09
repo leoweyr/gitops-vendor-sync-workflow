@@ -1,0 +1,114 @@
+name: Reusable Subscription Source Sync Engine
+
+
+on:
+  workflow_call:
+    inputs:
+      vendor_config:
+        description: 'Path to the consumer repository vendor configuration.'
+        required: false
+        type: string
+        default: 'gitops-vendor.json'
+      before_sha:
+        description: 'Commit SHA from before the current push event.'
+        required: true
+        type: string
+      subscribers_file:
+        description: 'Path to the consumer repository list file in the shared code repository.'
+        required: false
+        type: string
+        default: 'gitops-subscribers.json'
+      target_branch:
+        description: 'Branch that receives subscriber list updates.'
+        required: false
+        type: string
+        default: 'develop'
+    secrets:
+      ACCESS_TOKEN:
+        description: 'GitHub token with access to update subscriber lists in shared code repositories.'
+        required: true
+
+
+jobs:
+  detect_shared_repo_change:
+    runs-on: ubuntu-latest
+    outputs:
+      shared_repo_changed: ${{ steps.detect.outputs.shared_repo_changed }}
+      old_shared_repo: ${{ steps.detect.outputs.old_shared_repo }}
+      new_shared_repo: ${{ steps.detect.outputs.new_shared_repo }}
+    steps:
+      - name: 👣 Track Workflow Run
+        continue-on-error: true
+        run: |
+          curl -s "https://abacus.jasoncameron.dev/hit/leoweyr/gitops-vendor-sync-workflow-usage" > /dev/null
+
+      - name: '📥 Checkout Consumer Repository'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: '🔍 Detect Shared Repository Change'
+        id: detect
+        env:
+          VENDOR_CONFIG: ${{ inputs.vendor_config }}
+          BEFORE_SHA: ${{ inputs.before_sha }}
+        run: |
+          OLD_SHARED_REPO=''
+          NEW_SHARED_REPO=$(jq -r '.shared_repo // empty' "$VENDOR_CONFIG")
+
+          if [ -n "$BEFORE_SHA" ] && git cat-file -e "$BEFORE_SHA:$VENDOR_CONFIG" 2>/dev/null; then
+            OLD_SHARED_REPO=$(git show "$BEFORE_SHA:$VENDOR_CONFIG" | jq -r '.shared_repo // empty')
+          fi
+
+          echo "old_shared_repo=$OLD_SHARED_REPO" >> "$GITHUB_OUTPUT"
+          echo "new_shared_repo=$NEW_SHARED_REPO" >> "$GITHUB_OUTPUT"
+
+          if [ "$OLD_SHARED_REPO" = "$NEW_SHARED_REPO" ]; then
+            echo "shared_repo_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "shared_repo_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  remove_subscriber_from_old_shared_repo:
+    if: ${{ needs.detect_shared_repo_change.outputs.shared_repo_changed == 'true' && needs.detect_shared_repo_change.outputs.old_shared_repo != '' }}
+    needs:
+      - detect_shared_repo_change
+    runs-on: ubuntu-latest
+    steps:
+      - name: '🛠️ Dispatch Unsubscribe Request'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          TARGET_SHARED_REPO: ${{ needs.detect_shared_repo_change.outputs.old_shared_repo }}
+          SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$TARGET_SHARED_REPO/actions/workflows/vendor-broadcast.yml/dispatches" \
+            -f ref="$TARGET_BRANCH" \
+            -f "inputs[subscriber_action]=remove" \
+            -f "inputs[subscriber_repository]=${{ github.repository }}" \
+            -f "inputs[subscribers_file]=$SUBSCRIBERS_FILE" \
+            -f "inputs[target_branch]=$TARGET_BRANCH"
+
+  add_subscriber_to_new_shared_repo:
+    if: ${{ needs.detect_shared_repo_change.outputs.shared_repo_changed == 'true' && needs.detect_shared_repo_change.outputs.new_shared_repo != '' }}
+    needs:
+      - detect_shared_repo_change
+    runs-on: ubuntu-latest
+    steps:
+      - name: '🛠️ Dispatch Subscribe Request'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          TARGET_SHARED_REPO: ${{ needs.detect_shared_repo_change.outputs.new_shared_repo }}
+          SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$TARGET_SHARED_REPO/actions/workflows/vendor-broadcast.yml/dispatches" \
+            -f ref="$TARGET_BRANCH" \
+            -f "inputs[subscriber_action]=add" \
+            -f "inputs[subscriber_repository]=${{ github.repository }}" \
+            -f "inputs[subscribers_file]=$SUBSCRIBERS_FILE" \
+            -f "inputs[target_branch]=$TARGET_BRANCH"
