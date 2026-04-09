@@ -9,6 +9,11 @@ on:
         required: false
         type: string
         default: '.github/subscribers.json'
+      shared_config:
+        description: 'Path to the shared code manifest in the shared code repository.'
+        required: false
+        type: string
+        default: 'gitops-shared.json'
       event_type:
         description: 'Name of the broadcast event.'
         required: false
@@ -31,10 +36,26 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           CONFIG_FILE: ${{ inputs.subscribers_file }}
+          SHARED_CONFIG_FILE: ${{ inputs.shared_config }}
           EVENT_TYPE: ${{ inputs.event_type }}
         run: |
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "❌ Error: Subscribers list not found at $CONFIG_FILE."
+            exit 1
+          fi
+
+          if ! jq -e 'type == "array"' "$CONFIG_FILE" >/dev/null; then
+            echo "❌ Error: Subscribers file must be a JSON array."
+            exit 1
+          fi
+
+          if [ ! -f "$SHARED_CONFIG_FILE" ]; then
+            echo "❌ Error: Shared config not found at $SHARED_CONFIG_FILE."
+            exit 1
+          fi
+
+          if ! jq -e 'type == "array"' "$SHARED_CONFIG_FILE" >/dev/null; then
+            echo "❌ Error: Shared config must be a JSON array."
             exit 1
           fi
 
@@ -48,5 +69,9 @@ jobs:
               --method POST \
               -H 'Accept: application/vnd.github.v3+json' \
               "/repos/$target_repo/dispatches" \
-              -f event_type="$EVENT_TYPE" || echo "⚠️ Failed to dispatch to $target_repo."
+              -f event_type="$EVENT_TYPE" \
+              -f client_payload[shared_manifest_path]="$SHARED_CONFIG_FILE" \
+              -f client_payload[shared_manifest_ref]="$GITHUB_SHA" \
+              -f client_payload[shared_repository]="$GITHUB_REPOSITORY" \
+              -f client_payload[shared_revision]="$GITHUB_SHA" || echo "⚠️ Failed to dispatch to $target_repo."
           done
