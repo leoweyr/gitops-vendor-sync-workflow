@@ -313,15 +313,33 @@ jobs:
 
             HAS_PREVIOUS=$(jq -r --arg id "$ITEM_ID" 'has($id)' "$LOCK_FILE")
             OLD_VERSION=''
-          
+            OLD_PATH=''
+           
             if [ "$HAS_PREVIOUS" = 'true' ]; then
               OLD_VERSION=$(jq -r --arg id "$ITEM_ID" '.[$id].version // empty' "$LOCK_FILE")
               OLD_VERSION=$(normalize_semver "$OLD_VERSION")
+              OLD_PATH=$(jq -r --arg id "$ITEM_ID" '.[$id].path // .[$id].target_path // empty' "$LOCK_FILE")
             fi
-          
+           
             NEW_VERSION=$(normalize_semver "$MATCHED_VERSION")
 
             echo "📂 Vendoring $ITEM_ID@$NEW_VERSION from $MATCHED_SOURCE to $TARGET_PATH."
+
+            if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" = "$NEW_VERSION" ] && [ -n "$OLD_PATH" ] && [ "$OLD_PATH" != "$TARGET_PATH" ]; then
+              echo "❌ Error: Path change for id '$ITEM_ID' requires a version bump (from $OLD_PATH to $TARGET_PATH)."
+              exit 1
+            fi
+
+            if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$OLD_PATH" ] && [ "$OLD_PATH" != "$TARGET_PATH" ]; then
+              if [ -e "$OLD_PATH" ] && [ ! -f "$OLD_PATH" ]; then
+                echo "❌ Error: Previous vendored path is not a file at $OLD_PATH."
+                exit 1
+              fi
+
+              rm -f -- "$OLD_PATH"
+              git add -A -- "$OLD_PATH"
+              echo "🔄 Replaced vendored file path for id '$ITEM_ID' from $OLD_PATH to $TARGET_PATH."
+            fi
 
             if ! gh api \
               -H 'Accept: application/vnd.github.v3.raw' \
@@ -353,7 +371,7 @@ jobs:
               continue
             fi
 
-            if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+            if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" = "$NEW_VERSION" ] && [ "$OLD_PATH" = "$TARGET_PATH" ]; then
               echo "❌ Error: Detected file changes for id '$ITEM_ID' without a version change."
               exit 1
             fi
