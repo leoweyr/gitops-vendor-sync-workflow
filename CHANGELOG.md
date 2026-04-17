@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+# [1.0.1](https://github.com/leoweyr/gitops-vendor-sync-workflow/compare/v1.0.0...v1.0.1) (2026-04-17)
+### Bug Fixes
+
+* remove old vendored file when source filename changes ([44594e3](https://github.com/leoweyr/gitops-vendor-sync-workflow/commit/44594e372876ee181dfc803d607ac9483a7dd209)) [@leoweyr](https://github.com/leoweyr)
+
+
+
 # [1.0.0] (2026-04-09)
 ### Bug Fixes
 
