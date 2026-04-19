@@ -28,6 +28,9 @@ on:
 jobs:
   update_shared_manifest:
     runs-on: ubuntu-latest
+    concurrency:
+      group: 'shared-manifest-update-${{ github.repository }}-${{ inputs.target_branch }}'
+      cancel-in-progress: false
     steps:
       - name: 👣 Track Workflow Run
         continue-on-error: true
@@ -179,4 +182,21 @@ jobs:
 
           git add -- "$CONFIG_FILE"
           git commit -m "ci(vendor-broadcast): add $SHARED_ID $SHARED_VERSION"
+
+          if git push origin "HEAD:$TARGET_BRANCH"; then
+            exit 0
+          fi
+
+          echo "⏳ Push rejected, rebasing on latest $TARGET_BRANCH and retrying."
+          
+          git fetch origin "$TARGET_BRANCH"
+
+          if ! git rebase "origin/$TARGET_BRANCH"; then
+            echo "❌ Error: Failed to rebase on origin/$TARGET_BRANCH after push rejection."
+            
+            git rebase --abort || true
+            
+            exit 1
+          fi
+
           git push origin "HEAD:$TARGET_BRANCH"
