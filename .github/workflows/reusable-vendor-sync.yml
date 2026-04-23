@@ -389,7 +389,35 @@ jobs:
 
           if [ "$COMMITS_CREATED" -gt 0 ]; then
             echo "🚀 Pushing $COMMITS_CREATED dependency commit(s) to develop."
-            git push origin HEAD:develop
+          
+            ATTEMPT=1
+            MAX_ATTEMPTS=5
+            
+            while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+              if git push origin HEAD:develop; then
+                break
+              fi
+
+              if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]; then
+                echo "❌ Error: Failed to push dependency commits after $MAX_ATTEMPTS attempts."
+          
+                exit 1
+              fi
+
+              echo "⏳ Push rejected, rebasing on latest develop and retrying (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS)."
+              
+              ATTEMPT=$((ATTEMPT + 1))
+
+              git fetch origin develop
+          
+              if ! git rebase origin/develop; then
+                echo "❌ Error: Failed to rebase dependency commits on latest develop."
+                
+                git rebase --abort || true
+                
+                exit 1
+              fi
+            done
           else
             echo "✅ No dependency updates detected."
           fi
