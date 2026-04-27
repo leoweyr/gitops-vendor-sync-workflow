@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+# [1.0.2](https://github.com/leoweyr/gitops-vendor-sync-workflow/compare/v1.0.1...v1.0.2) (2026-04-23)
+### Bug Fixes
+
+* serialize shared manifest pushes and retry on non-fast-forward ([18bbbab](https://github.com/leoweyr/gitops-vendor-sync-workflow/commit/18bbbabb81eb2eb616e1cdf48742d92a750a4e3e)) [@leoweyr](https://github.com/leoweyr)
+* prevent dropped shared tag updates under concurrent pushes ([09f24d5](https://github.com/leoweyr/gitops-vendor-sync-workflow/commit/09f24d507fa90977998a8ad8fb61bd12072090e0)) [@leoweyr](https://github.com/leoweyr)
+* retry dependency push up to 5 times with rebase on rejection ([68aba51](https://github.com/leoweyr/gitops-vendor-sync-workflow/commit/68aba51162da932c28780f1a8eb3557b01be5908)) [@leoweyr](https://github.com/leoweyr)
+
+
+
 # [1.0.1](https://github.com/leoweyr/gitops-vendor-sync-workflow/compare/v1.0.0...v1.0.1) (2026-04-17)
 ### Bug Fixes
 
