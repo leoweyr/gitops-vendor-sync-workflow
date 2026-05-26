@@ -68,7 +68,7 @@ jobs:
               echo "✅ Subscriber list file does not exist, nothing to remove."
               exit 0
             fi
-          
+
             echo '[]' > "$SUBSCRIBERS_FILE"
           fi
 
@@ -80,14 +80,14 @@ jobs:
           EXISTS=$(jq -r --arg repo "$CONSUMER_REPOSITORY" 'index($repo) != null' "$SUBSCRIBERS_FILE")
 
           TMP_FILE=$(mktemp)
-          
+
           if [ "$SUBSCRIPTION_ACTION" = 'add' ]; then
             if [ "$EXISTS" = 'true' ]; then
               echo "✅ Subscriber already exists, nothing to add."
               rm -f "$TMP_FILE"
               exit 0
             fi
-          
+
             jq --arg repo "$CONSUMER_REPOSITORY" '. + [$repo]' "$SUBSCRIBERS_FILE" > "$TMP_FILE"
           else
             if [ "$EXISTS" != 'true' ]; then
@@ -95,7 +95,7 @@ jobs:
               rm -f "$TMP_FILE"
               exit 0
             fi
-          
+
             jq --arg repo "$CONSUMER_REPOSITORY" 'map(select(. != $repo))' "$SUBSCRIBERS_FILE" > "$TMP_FILE"
           fi
 

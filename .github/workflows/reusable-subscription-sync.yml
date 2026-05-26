@@ -33,9 +33,10 @@ jobs:
   detect_shared_repo_change:
     runs-on: ubuntu-latest
     outputs:
-      shared_repo_changed: ${{ steps.detect.outputs.shared_repo_changed }}
-      old_shared_repo: ${{ steps.detect.outputs.old_shared_repo }}
-      new_shared_repo: ${{ steps.detect.outputs.new_shared_repo }}
+      has_removed: ${{ steps.detect.outputs.has_removed }}
+      has_added: ${{ steps.detect.outputs.has_added }}
+      removed_repos: ${{ steps.detect.outputs.removed_repos }}
+      added_repos: ${{ steps.detect.outputs.added_repos }}
     steps:
       - name: 👣 Track Workflow Run
         continue-on-error: true
@@ -53,32 +54,46 @@ jobs:
           VENDOR_CONFIG: ${{ inputs.vendor_config }}
           BEFORE_SHA: ${{ inputs.before_sha }}
         run: |
-          OLD_SHARED_REPO=''
-          NEW_SHARED_REPO=$(jq -r '.shared_repo // empty' "$VENDOR_CONFIG")
-
-          if [ -n "$BEFORE_SHA" ] && git cat-file -e "$BEFORE_SHA:$VENDOR_CONFIG" 2>/dev/null; then
-            OLD_SHARED_REPO=$(git show "$BEFORE_SHA:$VENDOR_CONFIG" | jq -r '.shared_repo // empty')
-          fi
-
-          echo "old_shared_repo=$OLD_SHARED_REPO" >> "$GITHUB_OUTPUT"
-          echo "new_shared_repo=$NEW_SHARED_REPO" >> "$GITHUB_OUTPUT"
-
-          if [ "$OLD_SHARED_REPO" = "$NEW_SHARED_REPO" ]; then
-            echo "shared_repo_changed=false" >> "$GITHUB_OUTPUT"
+          # Parse current and previous repos, supporting both single object and array formats.
+          OLD_REPOS_JSON=$(if [ -n "$BEFORE_SHA" ] && git cat-file -e "$BEFORE_SHA:$VENDOR_CONFIG" 2>/dev/null; then
+            git show "$BEFORE_SHA:$VENDOR_CONFIG" | jq -c 'if type == "array" then [.[].shared_repo] else [.shared_repo // .upstream_repo] end | map(select(. != null))'
           else
-            echo "shared_repo_changed=true" >> "$GITHUB_OUTPUT"
+            echo '[]'
+          fi)
+          
+          NEW_REPOS_JSON=$(jq -c 'if type == "array" then [.[].shared_repo] else [.shared_repo // .upstream_repo] end | map(select(. != null))' "$VENDOR_CONFIG")
+
+          REMOVED_REPOS=$(jq -nc --argjson old "$OLD_REPOS_JSON" --argjson new "$NEW_REPOS_JSON" '$old - $new')
+          ADDED_REPOS=$(jq -nc --argjson old "$OLD_REPOS_JSON" --argjson new "$NEW_REPOS_JSON" '$new - $old')
+
+          echo "removed_repos=$REMOVED_REPOS" >> "$GITHUB_OUTPUT"
+          echo "added_repos=$ADDED_REPOS" >> "$GITHUB_OUTPUT"
+          
+          if [ "$(echo "$REMOVED_REPOS" | jq 'length')" -gt 0 ]; then
+            echo "has_removed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_removed=false" >> "$GITHUB_OUTPUT"
           fi
 
-  remove_subscriber_from_old_shared_repo:
-    if: ${{ needs.detect_shared_repo_change.outputs.shared_repo_changed == 'true' && needs.detect_shared_repo_change.outputs.old_shared_repo != '' }}
+          if [ "$(echo "$ADDED_REPOS" | jq 'length')" -gt 0 ]; then
+            echo "has_added=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_added=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  remove_subscriber_from_old_shared_repos:
+    if: ${{ needs.detect_shared_repo_change.outputs.has_removed == 'true' }}
     needs:
       - detect_shared_repo_change
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: ${{ fromJson(needs.detect_shared_repo_change.outputs.removed_repos) }}
     steps:
       - name: '🛠️ Dispatch Unsubscribe Request'
         env:
           GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          TARGET_SHARED_REPO: ${{ needs.detect_shared_repo_change.outputs.old_shared_repo }}
+          TARGET_SHARED_REPO: ${{ matrix.repo }}
           SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
@@ -91,16 +106,19 @@ jobs:
             -f "inputs[subscribers_file]=$SUBSCRIBERS_FILE" \
             -f "inputs[target_branch]=$TARGET_BRANCH"
 
-  add_subscriber_to_new_shared_repo:
-    if: ${{ needs.detect_shared_repo_change.outputs.shared_repo_changed == 'true' && needs.detect_shared_repo_change.outputs.new_shared_repo != '' }}
+  add_subscriber_to_new_shared_repos:
+    if: ${{ needs.detect_shared_repo_change.outputs.has_added == 'true' }}
     needs:
       - detect_shared_repo_change
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: ${{ fromJson(needs.detect_shared_repo_change.outputs.added_repos) }}
     steps:
       - name: '🛠️ Dispatch Subscribe Request'
         env:
           GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          TARGET_SHARED_REPO: ${{ needs.detect_shared_repo_change.outputs.new_shared_repo }}
+          TARGET_SHARED_REPO: ${{ matrix.repo }}
           SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
