@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+# [1.1.0](https://github.com/leoweyr/gitops-vendor-sync-workflow/compare/v1.0.2...v1.1.0) (2026-05-27)
+### Features
+
+* support multiple subscription ([2722519](https://github.com/leoweyr/gitops-vendor-sync-workflow/commit/27225195ef8bfd32225f4d3b7e893276e7a9eb67)) [@leoweyr](https://github.com/leoweyr)
+
+
+
 # [1.0.2](https://github.com/leoweyr/gitops-vendor-sync-workflow/compare/v1.0.1...v1.0.2) (2026-04-23)
 ### Bug Fixes
 
