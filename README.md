@@ -61,17 +61,30 @@ Use this project on each **consumer repository** to pull shared codes by id with
 `gitops-vendor.json` example:
 
 ```json
-{
-  "shared_repo": "your-org/shared-code-repo",
-  "shared_manifest_ref": "main",
-  "dependencies": [
-    {
-      "id": "vendor-broadcast",
-      "version": "^1.0.0",
-      "target_dir": ".github/workflows"
-    }
-  ]
-}
+[
+   {
+      "shared_repo": "your-org/shared-code-repo-a",
+      "shared_manifest_ref": "main",
+      "dependencies": [
+         {
+            "id": "vendor-broadcast",
+            "version": "^1.0.0",
+            "target_dir": ".github/workflows"
+         }
+      ]
+   },
+   {
+      "shared_repo": "your-org/shared-code-repo-b",
+      "shared_manifest_ref": "main",
+      "dependencies": [
+         {
+            "id": "vendor-sync",
+            "version": "^1.0.0",
+            "target_dir": ".github/workflows"
+         }
+      ]
+   }
+]
 ```
 
 `version` uses semantic-version range matching rules:

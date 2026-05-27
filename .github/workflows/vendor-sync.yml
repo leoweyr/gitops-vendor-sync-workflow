@@ -37,5 +37,6 @@ jobs:
     uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-sync.yml@develop
     with:
       vendor_config: 'gitops-vendor.json'
+      target_shared_repository: ${{ github.event.client_payload.shared_repository }}
     secrets:
       ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
