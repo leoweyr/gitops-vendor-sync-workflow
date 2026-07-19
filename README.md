@@ -26,7 +26,8 @@ Use this project on your **shared code repository** to publish versioned shared 
       {
         "version": "1.0.0",
         "source": ".github/workflows/vendor-broadcast.yml",
-        "ref": "refs/tags/shared/vendor-broadcast/v1.0.0"
+        "ref": "refs/tags/shared/vendor-broadcast/v1.0.0",
+        "default_target_dir": ".github/workflows"
       }
     ]
   }
@@ -48,7 +49,7 @@ Tag-driven publish flow:
    git push origin shared/vendor-broadcast/v1.0.0
    ```
    
-2. If the `id` exists and the version is new, `gitops-shared.json` is updated idempotently.
+2. If the `id` exists and the version is new, `gitops-shared.json` is updated idempotently. The new version explicitly inherits `default_target_dir` from the previous version when it is configured.
 3. Then dispatches to all consumer repositories listed in `gitops-subscribers.json`.
 
 ## 📥 Consumer Repository Usage
@@ -68,8 +69,7 @@ Use this project on each **consumer repository** to pull shared codes by id with
       "dependencies": [
          {
             "id": "vendor-broadcast",
-            "version": "^1.0.0",
-            "target_dir": ".github/workflows"
+            "version": "^1.0.0"
          }
       ]
    },
@@ -99,7 +99,7 @@ Use this project on each **consumer repository** to pull shared codes by id with
 
 For each dependency id, the workflow selects the highest available version that satisfies the configured range.
 
-`target_dir` means the destination directory inside the current consumer repository where the shared code file is synchronized.
+`default_target_dir` is an optional per-version setting in `gitops-shared.json`. It provides the destination directory inside the consumer repository when a dependency omits `target_dir`. The `target_dir` specified in `gitops-vendor.json` overrides the matched version's `default_target_dir`, so a dependency must configure `target_dir` when its matched shared version has no default.
 
 When `shared_repo` in `gitops-vendor.json` changes, `vendor-sync.yml` automatically synchronizes subscription state for your consumer repository:
 

@@ -296,13 +296,15 @@ jobs:
                     $f.versions[] | {
                       version: .version,
                       source: (.source // $f.source // empty),
-                      ref: (.ref // $f.ref // empty)
+                      ref: (.ref // $f.ref // empty),
+                      default_target_dir: (.default_target_dir // $f.default_target_dir // empty)
                     }
                   else
                     {
                       version: ($f.version // empty),
                       source: ($f.source // empty),
-                      ref: ($f.ref // empty)
+                      ref: ($f.ref // empty),
+                      default_target_dir: ($f.default_target_dir // empty)
                     }
                   end
                 ] | map(select(.version != "" and .source != ""))
@@ -319,17 +321,20 @@ jobs:
               MATCHED_VERSION=''
               MATCHED_SOURCE=''
               MATCHED_REFERENCE=''
+              MATCHED_DEFAULT_TARGET_DIRECTORY=''
 
               while IFS= read -r candidate; do
                 CANDIDATE_VERSION=$(echo "$candidate" | jq -r '.version')
                 CANDIDATE_SOURCE=$(echo "$candidate" | jq -r '.source')
                 CANDIDATE_REFERENCE=$(echo "$candidate" | jq -r '.ref // empty')
+                CANDIDATE_DEFAULT_TARGET_DIRECTORY=$(echo "$candidate" | jq -r '.default_target_dir // empty')
 
                 if version_satisfies_range "$CANDIDATE_VERSION" "$ITEM_VERSION_RANGE"; then
                   if [ -z "$MATCHED_VERSION" ] || semver_greater_than "$CANDIDATE_VERSION" "$MATCHED_VERSION"; then
                     MATCHED_VERSION="$CANDIDATE_VERSION"
                     MATCHED_SOURCE="$CANDIDATE_SOURCE"
                     MATCHED_REFERENCE="$CANDIDATE_REFERENCE"
+                    MATCHED_DEFAULT_TARGET_DIRECTORY="$CANDIDATE_DEFAULT_TARGET_DIRECTORY"
                   fi
                 fi
               done <<< "$(echo "$CANDIDATES" | jq -c '.[]')"
@@ -345,8 +350,11 @@ jobs:
               elif [ -n "$LEGACY_TARGET" ]; then
                 mkdir -p "$(dirname "$LEGACY_TARGET")"
                 TARGET_PATH="$LEGACY_TARGET"
+              elif [ -n "$MATCHED_DEFAULT_TARGET_DIRECTORY" ]; then
+                mkdir -p "$MATCHED_DEFAULT_TARGET_DIRECTORY"
+                TARGET_PATH="${MATCHED_DEFAULT_TARGET_DIRECTORY%/}/$(basename "$MATCHED_SOURCE")"
               else
-                echo "❌ Error: Each dependencies item must define target_dir (or legacy target)."
+                echo "❌ Error: Dependency '$ITEM_IDENTIFIER' must define target dir."
           
                 rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
           
