@@ -13,6 +13,16 @@ on:
         description: 'Specific shared repository to sync. If omitted, all sources in the config will be synced.'
         required: false
         type: string
+    outputs:
+      previous_shared_repositories:
+        description: 'JSON array of shared repositories tracked before dependency synchronization.'
+        value: ${{ jobs.materialize_dependencies.outputs.previous_shared_repositories }}
+      reachable_shared_repositories:
+        description: 'JSON array of shared repositories reachable from the current dependency graph.'
+        value: ${{ jobs.materialize_dependencies.outputs.reachable_shared_repositories }}
+      dependency_graph_complete:
+        description: 'Whether the complete dependency graph resolved successfully.'
+        value: ${{ jobs.materialize_dependencies.outputs.dependency_graph_complete }}
     secrets:
       ACCESS_TOKEN:
         description: 'GitHub token with read access to the shared code repository and write access to the consumer repository.'
@@ -22,6 +32,10 @@ on:
 jobs:
   materialize_dependencies:
     runs-on: ubuntu-latest
+    outputs:
+      previous_shared_repositories: ${{ steps.fetch_shared_artifacts_step.outputs.previous_shared_repositories }}
+      reachable_shared_repositories: ${{ steps.fetch_shared_artifacts_step.outputs.reachable_shared_repositories }}
+      dependency_graph_complete: ${{ steps.fetch_shared_artifacts_step.outputs.dependency_graph_complete }}
     steps:
       - name: 👣 Track Workflow Run
         continue-on-error: true
@@ -34,7 +48,8 @@ jobs:
           token: ${{ secrets.ACCESS_TOKEN }}
           fetch-depth: 0
 
-      - name: '📂 Fetch and Vendor Files'
+      - name: '📂 Fetch Shared Artifacts'
+        id: fetch_shared_artifacts_step
         env:
           GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           CONFIG_FILE: ${{ inputs.vendor_config }}
@@ -48,7 +63,7 @@ jobs:
           normalize_semver() {
             local raw_version="$1"
           
-            if [[ "$raw_version" =~ ^([\^~])v(.+)$ ]]; then
+            if [[ "$raw_version" =~ ^([~^])v(.+)$ ]]; then
               echo "${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
             else
               echo "${raw_version#v}"
@@ -69,9 +84,11 @@ jobs:
           }
 
           semver_compare() {
-            local a_major a_minor a_patch b_major b_minor b_patch
-            read -r a_major a_minor a_patch <<< "$(parse_semver "$1")" || return 1
-            read -r b_major b_minor b_patch <<< "$(parse_semver "$2")" || return 1
+            local a_major a_minor a_patch b_major b_minor b_patch parsed_a parsed_b
+            parsed_a=$(parse_semver "$1") || return 1
+            parsed_b=$(parse_semver "$2") || return 1
+            read -r a_major a_minor a_patch <<< "$parsed_a"
+            read -r b_major b_minor b_patch <<< "$parsed_b"
 
             if [ "$a_major" -gt "$b_major" ]; then
               echo 1
@@ -126,7 +143,7 @@ jobs:
 
           version_satisfies_range() {
             local version range normalized_version normalized_range
-            local major minor patch lower upper base_version
+            local major minor patch lower upper base_version parsed_base
 
             version="$1"
             range="$2"
@@ -139,8 +156,9 @@ jobs:
 
             case "$normalized_range" in
               ^*)
-                base_version="${normalized_range#^}"
-                read -r major minor patch <<< "$(parse_semver "$base_version")" || return 1
+                base_version="${normalized_range:1}"
+                parsed_base=$(parse_semver "$base_version") || return 1
+                read -r major minor patch <<< "$parsed_base"
                 lower="$major.$minor.$patch"
           
                 if [ "$major" -gt 0 ]; then
@@ -154,8 +172,9 @@ jobs:
                 semver_greater_than_or_equal "$normalized_version" "$lower" && semver_less_than "$normalized_version" "$upper"
                 ;;
               ~*)
-                base_version="${normalized_range#~}"
-                read -r major minor patch <<< "$(parse_semver "$base_version")" || return 1
+                base_version="${normalized_range:1}"
+                parsed_base=$(parse_semver "$base_version") || return 1
+                read -r major minor patch <<< "$parsed_base"
                 lower="$major.$minor.$patch"
                 upper="$major.$((minor + 1)).0"
                 semver_greater_than_or_equal "$normalized_version" "$lower" && semver_less_than "$normalized_version" "$upper"
@@ -191,272 +210,565 @@ jobs:
                   upper="$major.$((minor + 1)).0"
                   semver_greater_than_or_equal "$normalized_version" "$lower" && semver_less_than "$normalized_version" "$upper"
                 else
-                  read -r major minor patch <<< "$(parse_semver "$normalized_range")" || return 1
+                  parsed_base=$(parse_semver "$normalized_range") || return 1
+                  read -r major minor patch <<< "$parsed_base"
                   [ "$normalized_version" = "$major.$minor.$patch" ]
                 fi
                 ;;
             esac
           }
 
-          # Normalize config to an array of sources to support multi-source sync.
-          SOURCES_JSON=$(jq -c --arg target "$TARGET_SHARED_REPOSITORY" '
-            (if type == "array" then . else [.] end) |
-            if ($target != "") then
-              map(select((.shared_repo // .upstream_repo) == $target))
-            else
-              .
-            end
-          ' "$CONFIG_FILE")
+          SOURCES_JSON=$(jq -c 'if type == "array" then . else [.] end' "$CONFIG_FILE")
 
-          if [ "$(echo "$SOURCES_JSON" | jq 'length')" -eq 0 ]; then
-            if [ -n "$TARGET_SHARED_REPOSITORY" ]; then
-              echo "✅ No configuration found for targeted repository $TARGET_SHARED_REPOSITORY."
-              
-              exit 0
-            fi
-            echo "❌ Error: No sources found in vendor config."
-            
+          if ! echo "$SOURCES_JSON" | jq -e '
+            all(.[];
+              type == "object" and
+              ((.shared_repo // .upstream_repo // "") | type == "string" and length > 0) and
+              (.dependencies | type == "array")
+            )
+          ' >/dev/null; then
+            echo "❌ Error: Each source in vendor config must define a shared repository and dependencies array."
             exit 1
           fi
 
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          COMMITS_CREATED=0
+          LOCK_FILE='gitops-vendor-lock.json'
 
-          while read -r SOURCE_CONFIG; do
-            SHARED_REPOSITORY=$(echo "$SOURCE_CONFIG" | jq -r '.shared_repo // .upstream_repo // empty')
-            SHARED_MANIFEST_REFERENCE=$(echo "$SOURCE_CONFIG" | jq -r '.shared_manifest_ref // "main"')
-            SHARED_CONFIG_PATH='gitops-shared.json'
+          if [ ! -f "$LOCK_FILE" ]; then
+            echo '{}' > "$LOCK_FILE"
+          fi
 
-            if [ -z "$SHARED_REPOSITORY" ]; then
-              echo "❌ Error: Shared repository is required in vendor config."
-              
-              exit 1
-            fi
+          LOCK_REBUILD_REQUIRED=false
 
-            if ! echo "$SOURCE_CONFIG" | jq -e '.dependencies | type == "array"' >/dev/null; then
-              echo "❌ Error: Each source in vendor config must define a dependencies array."
-              
-              exit 1
-            fi
+          if ! jq -e '
+            type == "object" and
+            all(to_entries[];
+              (.key | type == "string" and length > 0) and
+              (.value | type == "object") and
+              (.value | keys | sort == ["path", "shared_repo", "version"]) and
+              (.value.shared_repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+              (.value.version | type == "string" and length > 0) and
+              (.value.path |
+                type == "string" and
+                length > 0 and
+                (startswith("/") | not) and
+                (test("(^|/)\\.\\.(/|$)") | not) and
+                (test("(^|/)\\.git(/|$)") | not)
+              )
+            )
+          ' "$LOCK_FILE" >/dev/null 2>&1; then
+            LOCK_REBUILD_REQUIRED=true
+            echo "⏳ Existing lock file does not match the required structure and will be rebuilt."
+          fi
 
-            SHARED_CONFIG_TEMPORARY_FILE=$(mktemp)
-          
-            if ! gh api \
-              -H 'Accept: application/vnd.github.v3.raw' \
-              "/repos/$SHARED_REPOSITORY/contents/$SHARED_CONFIG_PATH?ref=$SHARED_MANIFEST_REFERENCE" \
-              > "$SHARED_CONFIG_TEMPORARY_FILE"; then
-              echo "❌ Error: Failed to download shared config from $SHARED_REPOSITORY at $SHARED_CONFIG_PATH (ref: $SHARED_MANIFEST_REFERENCE)."
-              
-              rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-              
-              exit 1
-            fi
+          DEPENDENCY_QUEUE_FILE=$(mktemp)
+          EXPANDED_DEPENDENCIES_FILE=$(mktemp)
+          INITIAL_LOCK_FILE=$(mktemp)
+          REBUILD_LOCK_FILE=$(mktemp)
+          REACHABLE_SHARED_REPOSITORIES_FILE=$(mktemp)
+          RESOLVED_DEPENDENCIES_FILE=$(mktemp)
+          MANIFEST_CACHE_DIRECTORY=$(mktemp -d)
 
-            if ! jq -e 'type == "array"' "$SHARED_CONFIG_TEMPORARY_FILE" >/dev/null; then
-              echo "❌ Error: Shared config from $SHARED_REPOSITORY must be a JSON array."
-          
-              rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-          
-              exit 1
-            fi
+          if [ "$LOCK_REBUILD_REQUIRED" = 'true' ]; then
+            echo '{}' > "$INITIAL_LOCK_FILE"
+            echo '{}' > "$REBUILD_LOCK_FILE"
+            WORKING_LOCK_FILE="$REBUILD_LOCK_FILE"
+          else
+            cp "$LOCK_FILE" "$INITIAL_LOCK_FILE"
+            WORKING_LOCK_FILE="$LOCK_FILE"
+          fi
 
-            LOCK_FILE='gitops-vendor-lock.json'
-          
-            if [ ! -f "$LOCK_FILE" ]; then
-              echo '{}' > "$LOCK_FILE"
-            fi
+          cleanup_temporary_files() {
+            rm -f "$DEPENDENCY_QUEUE_FILE" "$EXPANDED_DEPENDENCIES_FILE" "$INITIAL_LOCK_FILE" "$REBUILD_LOCK_FILE" "$REACHABLE_SHARED_REPOSITORIES_FILE" "$RESOLVED_DEPENDENCIES_FILE"
+            rm -rf "$MANIFEST_CACHE_DIRECTORY"
+          }
 
-            if ! jq -e 'type == "object"' "$LOCK_FILE" >/dev/null; then
-              echo "❌ Error: Lock file must be a JSON object at $LOCK_FILE."
-          
-              rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
+          trap cleanup_temporary_files EXIT
 
-              exit 1
-            fi
+          if ! echo "$SOURCES_JSON" | jq -c '
+            [
+              .[] as $source
+              | $source.dependencies[]
+              | . + {
+                  shared_repo: (.shared_repo // $source.shared_repo // $source.upstream_repo // empty),
+                  shared_manifest_ref: (.shared_manifest_ref // $source.shared_manifest_ref // "main")
+                }
+            ]
+          ' > "$DEPENDENCY_QUEUE_FILE"; then
+            echo "❌ Error: Failed to initialize the dependency queue."
+            exit 1
+          fi
 
-            while read -r item; do
-              ITEM_IDENTIFIER=$(echo "$item" | jq -r '.id // empty')
-              ITEM_VERSION_RANGE=$(echo "$item" | jq -r '.version // empty')
-              ITEM_TARGET_DIRECTORY=$(echo "$item" | jq -r '.target_dir // empty')
-              LEGACY_TARGET=$(echo "$item" | jq -r '.target // empty')
+          echo '{}' > "$RESOLVED_DEPENDENCIES_FILE"
+          echo '{}' > "$EXPANDED_DEPENDENCIES_FILE"
+          echo '[]' > "$REACHABLE_SHARED_REPOSITORIES_FILE"
 
-              if [ -z "$ITEM_IDENTIFIER" ] || [ -z "$ITEM_VERSION_RANGE" ]; then
-                echo "❌ Error: Each dependencies item must define id and version."
-          
-                rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-          
-                exit 1
-              fi
+          fetch_shared_manifest() {
+            local shared_repository="$1"
+            local shared_manifest_reference="$2"
+            local cache_key manifest_file
 
-              CANDIDATES=$(jq -c --arg id "$ITEM_IDENTIFIER" '
-                [
-                  .[] | select(.id == $id) as $f |
-                  if (($f.versions // null) | type) == "array" then
-                    $f.versions[] | {
-                      version: .version,
-                      source: (.source // $f.source // empty),
-                      ref: (.ref // $f.ref // empty),
-                      default_target_dir: (.default_target_dir // $f.default_target_dir // empty)
-                    }
-                  else
-                    {
-                      version: ($f.version // empty),
-                      source: ($f.source // empty),
-                      ref: ($f.ref // empty),
-                      default_target_dir: ($f.default_target_dir // empty)
-                    }
-                  end
-                ] | map(select(.version != "" and .source != ""))
-              ' "$SHARED_CONFIG_TEMPORARY_FILE")
+            cache_key=$(printf '%s\n%s' "$shared_repository" "$shared_manifest_reference" | sha256sum | cut -d ' ' -f 1)
+            manifest_file="$MANIFEST_CACHE_DIRECTORY/$cache_key.json"
 
-              if [ "$(echo "$CANDIDATES" | jq 'length')" -eq 0 ]; then
-                echo "❌ Error: No shared code item found for id '$ITEM_IDENTIFIER' in $SHARED_REPOSITORY."
-          
-                rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-          
-                exit 1
-              fi
-
-              MATCHED_VERSION=''
-              MATCHED_SOURCE=''
-              MATCHED_REFERENCE=''
-              MATCHED_DEFAULT_TARGET_DIRECTORY=''
-
-              while IFS= read -r candidate; do
-                CANDIDATE_VERSION=$(echo "$candidate" | jq -r '.version')
-                CANDIDATE_SOURCE=$(echo "$candidate" | jq -r '.source')
-                CANDIDATE_REFERENCE=$(echo "$candidate" | jq -r '.ref // empty')
-                CANDIDATE_DEFAULT_TARGET_DIRECTORY=$(echo "$candidate" | jq -r '.default_target_dir // empty')
-
-                if version_satisfies_range "$CANDIDATE_VERSION" "$ITEM_VERSION_RANGE"; then
-                  if [ -z "$MATCHED_VERSION" ] || semver_greater_than "$CANDIDATE_VERSION" "$MATCHED_VERSION"; then
-                    MATCHED_VERSION="$CANDIDATE_VERSION"
-                    MATCHED_SOURCE="$CANDIDATE_SOURCE"
-                    MATCHED_REFERENCE="$CANDIDATE_REFERENCE"
-                    MATCHED_DEFAULT_TARGET_DIRECTORY="$CANDIDATE_DEFAULT_TARGET_DIRECTORY"
-                  fi
-                fi
-              done <<< "$(echo "$CANDIDATES" | jq -c '.[]')"
-
-              if [ -z "$MATCHED_VERSION" ]; then
-                echo "⏳ No compatible version found for id '$ITEM_IDENTIFIER' with range '$ITEM_VERSION_RANGE' in $SHARED_REPOSITORY."
-                continue
-              fi
-
-              if [ -n "$ITEM_TARGET_DIRECTORY" ]; then
-                mkdir -p "$ITEM_TARGET_DIRECTORY"
-                TARGET_PATH="${ITEM_TARGET_DIRECTORY%/}/$(basename "$MATCHED_SOURCE")"
-              elif [ -n "$LEGACY_TARGET" ]; then
-                mkdir -p "$(dirname "$LEGACY_TARGET")"
-                TARGET_PATH="$LEGACY_TARGET"
-              elif [ -n "$MATCHED_DEFAULT_TARGET_DIRECTORY" ]; then
-                mkdir -p "$MATCHED_DEFAULT_TARGET_DIRECTORY"
-                TARGET_PATH="${MATCHED_DEFAULT_TARGET_DIRECTORY%/}/$(basename "$MATCHED_SOURCE")"
-              else
-                echo "❌ Error: Dependency '$ITEM_IDENTIFIER' must define target dir."
-          
-                rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-          
-                exit 1
-              fi
-
-              EFFECTIVE_REFERENCE="$SHARED_MANIFEST_REFERENCE"
-              if [ -n "$MATCHED_REFERENCE" ]; then
-                EFFECTIVE_REFERENCE="$MATCHED_REFERENCE"
-              fi
-
-              HAS_PREVIOUS=$(jq -r --arg id "$ITEM_IDENTIFIER" 'has($id)' "$LOCK_FILE")
-              OLD_VERSION=''
-              OLD_PATH=''
-             
-              if [ "$HAS_PREVIOUS" = 'true' ]; then
-                OLD_VERSION=$(jq -r --arg id "$ITEM_IDENTIFIER" '.[$id].version // empty' "$LOCK_FILE")
-                OLD_VERSION=$(normalize_semver "$OLD_VERSION")
-                OLD_PATH=$(jq -r --arg id "$ITEM_IDENTIFIER" '.[$id].path // .[$id].target_path // empty' "$LOCK_FILE")
-              fi
-             
-              NEW_VERSION=$(normalize_semver "$MATCHED_VERSION")
-
-              echo "📂 Vendoring $ITEM_IDENTIFIER@$NEW_VERSION from $MATCHED_SOURCE to $TARGET_PATH."
-
-              if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" = "$NEW_VERSION" ] && [ -n "$OLD_PATH" ] && [ "$OLD_PATH" != "$TARGET_PATH" ]; then
-                echo "❌ Error: Path change for id '$ITEM_IDENTIFIER' requires a version bump (from $OLD_PATH to $TARGET_PATH)."
-          
-                rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-          
-                exit 1
-              fi
-
-              if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$OLD_PATH" ] && [ "$OLD_PATH" != "$TARGET_PATH" ]; then
-                if [ -e "$OLD_PATH" ] && [ ! -f "$OLD_PATH" ]; then
-                  echo "❌ Error: Previous vendored path is not a file at $OLD_PATH."
-          
-                  rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-          
-                  exit 1
-                fi
-
-                rm -f -- "$OLD_PATH"
-                git add -A -- "$OLD_PATH"
-                echo "🔄 Replaced vendored file path for id '$ITEM_IDENTIFIER' from $OLD_PATH to $TARGET_PATH."
-              fi
-
+            if [ ! -f "$manifest_file" ]; then
               if ! gh api \
                 -H 'Accept: application/vnd.github.v3.raw' \
-                "/repos/$SHARED_REPOSITORY/contents/$MATCHED_SOURCE?ref=$EFFECTIVE_REFERENCE" \
-                > "$TARGET_PATH"; then
-                echo "❌ Error: Failed to fetch $MATCHED_SOURCE (id: $ITEM_IDENTIFIER, version: $MATCHED_VERSION from $SHARED_REPOSITORY)."
-                
-                rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-                
+                "/repos/$shared_repository/contents/gitops-shared.json?ref=$shared_manifest_reference" \
+                > "$manifest_file"; then
+                echo "❌ Error: Failed to download shared config from $shared_repository at gitops-shared.json (ref: $shared_manifest_reference)." >&2
+                rm -f "$manifest_file"
+                return 1
+              fi
+
+              if ! jq -e 'type == "array"' "$manifest_file" >/dev/null; then
+                echo "❌ Error: Shared config from $shared_repository must be a JSON array." >&2
+                rm -f "$manifest_file"
+                return 1
+              fi
+            fi
+
+            echo "$manifest_file"
+          }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          COMMITS_CREATED=0
+          DEPENDENCY_GRAPH_COMPLETE=true
+          QUEUE_INDEX=0
+          TARGET_REPOSITORY_MATCHED=false
+
+          while [ "$QUEUE_INDEX" -lt "$(jq 'length' "$DEPENDENCY_QUEUE_FILE")" ]; do
+            ITEM=$(jq -c --argjson index "$QUEUE_INDEX" '.[$index]' "$DEPENDENCY_QUEUE_FILE")
+            QUEUE_INDEX=$((QUEUE_INDEX + 1))
+
+            SHARED_REPOSITORY=$(echo "$ITEM" | jq -r '.shared_repo // .upstream_repo // empty')
+            SHARED_MANIFEST_REFERENCE=$(echo "$ITEM" | jq -r '.shared_manifest_ref // "main"')
+            ITEM_IDENTIFIER=$(echo "$ITEM" | jq -r '.id // empty')
+            ITEM_VERSION_RANGE=$(echo "$ITEM" | jq -r '.version // empty')
+            ITEM_TARGET_DIRECTORY=$(echo "$ITEM" | jq -r '.target_dir // .default_target_dir // empty')
+            LEGACY_TARGET=$(echo "$ITEM" | jq -r '.target // empty')
+            DECLARED_DEPENDENCIES=$(echo "$ITEM" | jq -c '.dependencies // []')
+
+            if [ -z "$SHARED_REPOSITORY" ] || [ -z "$ITEM_IDENTIFIER" ] || [ -z "$ITEM_VERSION_RANGE" ]; then
+              echo "❌ Error: Each dependency must define shared_repo, id, and version."
+              exit 1
+            fi
+
+            REACHABLE_REPOSITORIES_TEMPORARY_FILE=$(mktemp)
+
+            if ! jq --arg repository "$SHARED_REPOSITORY" \
+              '. + [$repository] | unique' \
+              "$REACHABLE_SHARED_REPOSITORIES_FILE" > "$REACHABLE_REPOSITORIES_TEMPORARY_FILE"; then
+              echo "❌ Error: Failed to track reachable shared repository $SHARED_REPOSITORY."
+              rm -f "$REACHABLE_REPOSITORIES_TEMPORARY_FILE"
+              exit 1
+            fi
+
+            mv "$REACHABLE_REPOSITORIES_TEMPORARY_FILE" "$REACHABLE_SHARED_REPOSITORIES_FILE"
+
+            if ! echo "$DECLARED_DEPENDENCIES" | jq -e 'type == "array"' >/dev/null; then
+              echo "❌ Error: Dependencies declared by '$ITEM_IDENTIFIER' must be a JSON array."
+              exit 1
+            fi
+
+            if [ -n "$TARGET_SHARED_REPOSITORY" ] && [ "$SHARED_REPOSITORY" = "$TARGET_SHARED_REPOSITORY" ]; then
+              TARGET_REPOSITORY_MATCHED=true
+            fi
+
+            if ! SHARED_CONFIG_TEMPORARY_FILE=$(fetch_shared_manifest "$SHARED_REPOSITORY" "$SHARED_MANIFEST_REFERENCE"); then
+              exit 1
+            fi
+
+            if ! CANDIDATES=$(jq -c --arg id "$ITEM_IDENTIFIER" '
+              [
+                .[] | select(.id == $id) as $artifact |
+                if (($artifact.versions // null) | type) == "array" then
+                  $artifact.versions[] | {
+                    version: .version,
+                    source: (.source // $artifact.source // empty),
+                    ref: (.ref // $artifact.ref // ""),
+                    default_target_dir: (.default_target_dir // $artifact.default_target_dir // ""),
+                    dependencies: (.dependencies // $artifact.dependencies // [])
+                  }
+                else
+                  {
+                    version: ($artifact.version // empty),
+                    source: ($artifact.source // empty),
+                    ref: ($artifact.ref // ""),
+                    default_target_dir: ($artifact.default_target_dir // ""),
+                    dependencies: ($artifact.dependencies // [])
+                  }
+                end
+              ] | map(select(.version != "" and .source != ""))
+            ' "$SHARED_CONFIG_TEMPORARY_FILE"); then
+              echo "❌ Error: Failed to read shared artifact '$ITEM_IDENTIFIER' from $SHARED_REPOSITORY."
+              exit 1
+            fi
+
+            if [ "$(echo "$CANDIDATES" | jq 'length')" -eq 0 ]; then
+              echo "❌ Error: No shared artifact found for id '$ITEM_IDENTIFIER' in $SHARED_REPOSITORY."
+              exit 1
+            fi
+
+            MATCHED_VERSION=''
+            MATCHED_SOURCE=''
+            MATCHED_REFERENCE=''
+            MATCHED_DEFAULT_TARGET_DIRECTORY=''
+            MATCHED_DEPENDENCIES='[]'
+
+            while IFS= read -r CANDIDATE; do
+              CANDIDATE_VERSION=$(echo "$CANDIDATE" | jq -r '.version')
+              CANDIDATE_SOURCE=$(echo "$CANDIDATE" | jq -r '.source')
+              CANDIDATE_REFERENCE=$(echo "$CANDIDATE" | jq -r '.ref // empty')
+              CANDIDATE_DEFAULT_TARGET_DIRECTORY=$(echo "$CANDIDATE" | jq -r '.default_target_dir // empty')
+              CANDIDATE_DEPENDENCIES=$(echo "$CANDIDATE" | jq -c '.dependencies // []')
+
+              if version_satisfies_range "$CANDIDATE_VERSION" "$ITEM_VERSION_RANGE"; then
+                if [ -z "$MATCHED_VERSION" ] || semver_greater_than "$CANDIDATE_VERSION" "$MATCHED_VERSION"; then
+                  MATCHED_VERSION="$CANDIDATE_VERSION"
+                  MATCHED_SOURCE="$CANDIDATE_SOURCE"
+                  MATCHED_REFERENCE="$CANDIDATE_REFERENCE"
+                  MATCHED_DEFAULT_TARGET_DIRECTORY="$CANDIDATE_DEFAULT_TARGET_DIRECTORY"
+                  MATCHED_DEPENDENCIES="$CANDIDATE_DEPENDENCIES"
+                fi
+              fi
+            done <<< "$(echo "$CANDIDATES" | jq -c '.[]')"
+
+            if [ -z "$MATCHED_VERSION" ]; then
+              echo "⏳ No compatible version found for id '$ITEM_IDENTIFIER' with range '$ITEM_VERSION_RANGE' in $SHARED_REPOSITORY."
+              DEPENDENCY_GRAPH_COMPLETE=false
+              continue
+            fi
+
+            MATCHED_DEPENDENCIES=$(jq -nc \
+              --argjson published "$MATCHED_DEPENDENCIES" \
+              --argjson declared "$DECLARED_DEPENDENCIES" \
+              '$published + $declared')
+
+            if ! echo "$MATCHED_DEPENDENCIES" | jq -e '
+              type == "array" and
+              all(.[];
+                type == "object" and
+                ((.shared_repo // "") | type == "string" and length > 0) and
+                ((.id // "") | type == "string" and length > 0) and
+                ((.version // "") | type == "string" and length > 0) and
+                ((.shared_manifest_ref // "main") | type == "string" and length > 0) and
+                ((.default_target_dir // "") | type == "string")
+              )
+            ' >/dev/null; then
+              echo "❌ Error: Dependencies for '$ITEM_IDENTIFIER@$MATCHED_VERSION' must define valid shared_repo, id, and version fields."
+              exit 1
+            fi
+
+            if [ -n "$ITEM_TARGET_DIRECTORY" ]; then
+              mkdir -p "$ITEM_TARGET_DIRECTORY"
+              TARGET_PATH="${ITEM_TARGET_DIRECTORY%/}/$(basename "$MATCHED_SOURCE")"
+            elif [ -n "$LEGACY_TARGET" ]; then
+              mkdir -p "$(dirname "$LEGACY_TARGET")"
+              TARGET_PATH="$LEGACY_TARGET"
+            elif [ -n "$MATCHED_DEFAULT_TARGET_DIRECTORY" ]; then
+              mkdir -p "$MATCHED_DEFAULT_TARGET_DIRECTORY"
+              TARGET_PATH="${MATCHED_DEFAULT_TARGET_DIRECTORY%/}/$(basename "$MATCHED_SOURCE")"
+            else
+              echo "❌ Error: Dependency '$ITEM_IDENTIFIER' must define a target directory."
+              exit 1
+            fi
+
+            NEW_VERSION=$(normalize_semver "$MATCHED_VERSION")
+            DEPENDENCY_ALREADY_RESOLVED=false
+
+            if jq -e --arg id "$ITEM_IDENTIFIER" 'has($id)' "$RESOLVED_DEPENDENCIES_FILE" >/dev/null; then
+              RESOLVED_SHARED_REPOSITORY=$(jq -r --arg id "$ITEM_IDENTIFIER" '.[$id].shared_repo' "$RESOLVED_DEPENDENCIES_FILE")
+              RESOLVED_VERSION=$(jq -r --arg id "$ITEM_IDENTIFIER" '.[$id].version' "$RESOLVED_DEPENDENCIES_FILE")
+              RESOLVED_PATH=$(jq -r --arg id "$ITEM_IDENTIFIER" '.[$id].path' "$RESOLVED_DEPENDENCIES_FILE")
+
+              if [ "$RESOLVED_SHARED_REPOSITORY" != "$SHARED_REPOSITORY" ] || [ "$RESOLVED_VERSION" != "$NEW_VERSION" ] || [ "$RESOLVED_PATH" != "$TARGET_PATH" ]; then
+                echo "❌ Error: Dependency id '$ITEM_IDENTIFIER' resolves to conflicting repositories, versions, or target paths."
                 exit 1
               fi
 
+              DEPENDENCY_ALREADY_RESOLVED=true
+            else
+              RESOLVED_TEMPORARY_FILE=$(mktemp)
+
+              if ! jq \
+                --arg id "$ITEM_IDENTIFIER" \
+                --arg shared_repo "$SHARED_REPOSITORY" \
+                --arg version "$NEW_VERSION" \
+                --arg path "$TARGET_PATH" \
+                '.[$id] = { shared_repo: $shared_repo, version: $version, path: $path }' \
+                "$RESOLVED_DEPENDENCIES_FILE" > "$RESOLVED_TEMPORARY_FILE"; then
+                echo "❌ Error: Failed to record the resolution for dependency '$ITEM_IDENTIFIER'."
+                rm -f "$RESOLVED_TEMPORARY_FILE"
+                exit 1
+              fi
+
+              mv "$RESOLVED_TEMPORARY_FILE" "$RESOLVED_DEPENDENCIES_FILE"
+            fi
+
+            EXPANSION_KEY=$(printf '%s\n%s\n%s\n%s' \
+              "$SHARED_REPOSITORY" \
+              "$ITEM_IDENTIFIER" \
+              "$NEW_VERSION" \
+              "$MATCHED_DEPENDENCIES" \
+              | sha256sum \
+              | cut -d ' ' -f 1)
+
+            if ! jq -e --arg key "$EXPANSION_KEY" 'has($key)' "$EXPANDED_DEPENDENCIES_FILE" >/dev/null && \
+              [ "$(echo "$MATCHED_DEPENDENCIES" | jq 'length')" -gt 0 ]; then
+              NESTED_DEPENDENCIES=$(echo "$MATCHED_DEPENDENCIES" | jq -c '
+                [
+                  .[] | {
+                    shared_repo: .shared_repo,
+                    shared_manifest_ref: (.shared_manifest_ref // "main"),
+                    id: .id,
+                    version: .version,
+                    default_target_dir: (.default_target_dir // ""),
+                    dependencies: (.dependencies // [])
+                  }
+                ]
+              ')
+              QUEUE_TEMPORARY_FILE=$(mktemp)
+
+              if ! jq --argjson dependencies "$NESTED_DEPENDENCIES" \
+                '. + $dependencies' \
+                "$DEPENDENCY_QUEUE_FILE" > "$QUEUE_TEMPORARY_FILE"; then
+                echo "❌ Error: Failed to enqueue dependencies for '$ITEM_IDENTIFIER@$NEW_VERSION'."
+                rm -f "$QUEUE_TEMPORARY_FILE"
+                exit 1
+              fi
+
+              mv "$QUEUE_TEMPORARY_FILE" "$DEPENDENCY_QUEUE_FILE"
+            fi
+
+            EXPANDED_TEMPORARY_FILE=$(mktemp)
+
+            if ! jq --arg key "$EXPANSION_KEY" '.[$key] = true' \
+              "$EXPANDED_DEPENDENCIES_FILE" > "$EXPANDED_TEMPORARY_FILE"; then
+              echo "❌ Error: Failed to record dependency expansion for '$ITEM_IDENTIFIER@$NEW_VERSION'."
+              rm -f "$EXPANDED_TEMPORARY_FILE"
+              exit 1
+            fi
+
+            mv "$EXPANDED_TEMPORARY_FILE" "$EXPANDED_DEPENDENCIES_FILE"
+
+            if [ "$DEPENDENCY_ALREADY_RESOLVED" = 'true' ]; then
+              echo "✅ Dependency '$ITEM_IDENTIFIER@$NEW_VERSION' was already resolved."
+              continue
+            fi
+
+            EFFECTIVE_REFERENCE="$SHARED_MANIFEST_REFERENCE"
+
+            if [ -n "$MATCHED_REFERENCE" ]; then
+              EFFECTIVE_REFERENCE="$MATCHED_REFERENCE"
+            fi
+
+            HAS_PREVIOUS=$(jq -r --arg id "$ITEM_IDENTIFIER" 'has($id)' "$WORKING_LOCK_FILE")
+            OLD_VERSION=''
+            OLD_PATH=''
+            OLD_SHARED_REPOSITORY=''
+            UPDATE_LOCK_ENTRY=false
+
+            if [ "$HAS_PREVIOUS" = 'true' ]; then
+              OLD_VERSION=$(jq -r --arg id "$ITEM_IDENTIFIER" '.[$id].version // empty' "$WORKING_LOCK_FILE")
+              OLD_VERSION=$(normalize_semver "$OLD_VERSION")
+              OLD_PATH=$(jq -r --arg id "$ITEM_IDENTIFIER" '.[$id].path // empty' "$WORKING_LOCK_FILE")
+              OLD_SHARED_REPOSITORY=$(jq -r --arg id "$ITEM_IDENTIFIER" '.[$id].shared_repo // empty' "$WORKING_LOCK_FILE")
+
+              if [ "$OLD_SHARED_REPOSITORY" != "$SHARED_REPOSITORY" ]; then
+                echo "❌ Error: Dependency id '$ITEM_IDENTIFIER' cannot change shared_repo from '$OLD_SHARED_REPOSITORY' to '$SHARED_REPOSITORY'. Use a new dependency id for a different shared repository."
+                exit 1
+              fi
+            fi
+
+            if [ "$HAS_PREVIOUS" != 'true' ] || [ "$OLD_VERSION" != "$NEW_VERSION" ] || [ "$OLD_PATH" != "$TARGET_PATH" ]; then
+              UPDATE_LOCK_ENTRY=true
+            fi
+
+            echo "📂 Synchronizing shared artifact $ITEM_IDENTIFIER@$NEW_VERSION from $MATCHED_SOURCE to $TARGET_PATH."
+
+            if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" = "$NEW_VERSION" ] && [ -n "$OLD_PATH" ] && [ "$OLD_PATH" != "$TARGET_PATH" ]; then
+              echo "❌ Error: Path change for id '$ITEM_IDENTIFIER' requires a version bump (from $OLD_PATH to $TARGET_PATH)."
+              exit 1
+            fi
+
+            if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$OLD_PATH" ] && [ "$OLD_PATH" != "$TARGET_PATH" ]; then
+              if [ -e "$OLD_PATH" ] && [ ! -f "$OLD_PATH" ]; then
+                echo "❌ Error: Previous shared artifact path is not a file at $OLD_PATH."
+                exit 1
+              fi
+
+              rm -f -- "$OLD_PATH"
+              git add -A -- "$OLD_PATH"
+              echo "🔄 Replaced shared artifact path for id '$ITEM_IDENTIFIER' from $OLD_PATH to $TARGET_PATH."
+            fi
+
+            if ! gh api \
+              -H 'Accept: application/vnd.github.v3.raw' \
+              "/repos/$SHARED_REPOSITORY/contents/$MATCHED_SOURCE?ref=$EFFECTIVE_REFERENCE" \
+              > "$TARGET_PATH"; then
+              echo "❌ Error: Failed to fetch $MATCHED_SOURCE (id: $ITEM_IDENTIFIER, version: $MATCHED_VERSION from $SHARED_REPOSITORY)."
+              exit 1
+            fi
+
+            if [ "$UPDATE_LOCK_ENTRY" = 'true' ]; then
               LOCK_TEMPORARY_FILE=$(mktemp)
-            
+
               if ! jq \
                 --arg id "$ITEM_IDENTIFIER" \
                 --arg version "$NEW_VERSION" \
                 --arg path "$TARGET_PATH" \
-                '.[$id] = { version: $version, path: $path }' \
-                "$LOCK_FILE" > "$LOCK_TEMPORARY_FILE"; then
+                --arg shared_repo "$SHARED_REPOSITORY" \
+                '.[$id] = { shared_repo: $shared_repo, version: $version, path: $path }' \
+                "$WORKING_LOCK_FILE" > "$LOCK_TEMPORARY_FILE"; then
                 echo "❌ Error: Failed to update lock file for id '$ITEM_IDENTIFIER'."
-         
-                rm -f "$LOCK_TEMPORARY_FILE" "$SHARED_CONFIG_TEMPORARY_FILE"
-                
+                rm -f "$LOCK_TEMPORARY_FILE"
                 exit 1
               fi
-            
-              mv "$LOCK_TEMPORARY_FILE" "$LOCK_FILE"
 
-              git add -- "$TARGET_PATH" "$LOCK_FILE"
+              mv "$LOCK_TEMPORARY_FILE" "$WORKING_LOCK_FILE"
+            fi
 
-              if git diff --cached --quiet -- "$TARGET_PATH" "$LOCK_FILE"; then
-                echo "✅ No file changes detected for id '$ITEM_IDENTIFIER'."
+            git add -- "$TARGET_PATH" "$LOCK_FILE"
+
+            if git diff --cached --quiet -- "$TARGET_PATH" "$LOCK_FILE"; then
+              echo "✅ No shared artifact changes detected for id '$ITEM_IDENTIFIER'."
+              continue
+            fi
+
+            if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" = "$NEW_VERSION" ] && [ "$OLD_PATH" = "$TARGET_PATH" ]; then
+              echo "❌ Error: Detected shared artifact changes for id '$ITEM_IDENTIFIER' without a version change."
+              exit 1
+            elif [ "$HAS_PREVIOUS" = 'true' ]; then
+              COMMIT_MESSAGE="chore(deps): bump $ITEM_IDENTIFIER from $OLD_VERSION to $NEW_VERSION"
+            else
+              COMMIT_MESSAGE="chore(deps): add $ITEM_IDENTIFIER $NEW_VERSION"
+            fi
+
+            git commit -m "$COMMIT_MESSAGE"
+            COMMITS_CREATED=$((COMMITS_CREATED + 1))
+          done
+
+          if [ "$DEPENDENCY_GRAPH_COMPLETE" = 'true' ]; then
+            ORPHANED_DEPENDENCY_IDS=$(jq -nc \
+              --slurpfile lock "$WORKING_LOCK_FILE" \
+              --slurpfile resolved "$RESOLVED_DEPENDENCIES_FILE" \
+              '($lock[0] | keys) - ($resolved[0] | keys)')
+
+            while IFS= read -r ORPHANED_IDENTIFIER; do
+              ORPHANED_VERSION=$(jq -r --arg id "$ORPHANED_IDENTIFIER" '.[$id].version // "unknown"' "$WORKING_LOCK_FILE")
+              ORPHANED_PATH=$(jq -r --arg id "$ORPHANED_IDENTIFIER" '.[$id].path // empty' "$WORKING_LOCK_FILE")
+              PATH_REMAINS_REACHABLE=false
+
+              case "$ORPHANED_PATH" in
+                '')
+                  ;;
+                /*|'..'|../*|*/../*|'.git'|.git/*)
+                  echo "❌ Error: Refusing to remove unsafe orphaned path '$ORPHANED_PATH'."
+                  exit 1
+                  ;;
+              esac
+
+              if [ "$ORPHANED_PATH" = "$LOCK_FILE" ] || [ "$ORPHANED_PATH" = "$CONFIG_FILE" ]; then
+                echo "❌ Error: Refusing to remove protected repository file '$ORPHANED_PATH'."
+                exit 1
+              fi
+
+              if [ -n "$ORPHANED_PATH" ] && jq -e --arg path "$ORPHANED_PATH" \
+                'any(.[]; .path == $path)' \
+                "$RESOLVED_DEPENDENCIES_FILE" >/dev/null; then
+                PATH_REMAINS_REACHABLE=true
+              fi
+
+              if [ -n "$ORPHANED_PATH" ] && [ "$PATH_REMAINS_REACHABLE" != 'true' ]; then
+                if [ -e "$ORPHANED_PATH" ] && [ ! -f "$ORPHANED_PATH" ] && [ ! -L "$ORPHANED_PATH" ]; then
+                  echo "❌ Error: Orphaned shared artifact path is not a file at $ORPHANED_PATH."
+                  exit 1
+                fi
+
+                if [ -e "$ORPHANED_PATH" ] || [ -L "$ORPHANED_PATH" ]; then
+                  rm -f -- "$ORPHANED_PATH"
+                fi
+
+                if git ls-files --error-unmatch -- "$ORPHANED_PATH" >/dev/null 2>&1; then
+                  git add -A -- "$ORPHANED_PATH"
+                fi
+              elif [ "$PATH_REMAINS_REACHABLE" = 'true' ]; then
+                echo "✅ Preserving shared artifact path $ORPHANED_PATH because it remains reachable."
+              fi
+
+              LOCK_TEMPORARY_FILE=$(mktemp)
+
+              if ! jq --arg id "$ORPHANED_IDENTIFIER" 'del(.[$id])' \
+                "$WORKING_LOCK_FILE" > "$LOCK_TEMPORARY_FILE"; then
+                echo "❌ Error: Failed to remove orphaned dependency '$ORPHANED_IDENTIFIER' from the lock file."
+                rm -f "$LOCK_TEMPORARY_FILE"
+                exit 1
+              fi
+
+              mv "$LOCK_TEMPORARY_FILE" "$WORKING_LOCK_FILE"
+              git add -- "$LOCK_FILE"
+
+              if git diff --cached --quiet; then
                 continue
               fi
 
-              if [ "$HAS_PREVIOUS" = 'true' ] && [ "$OLD_VERSION" = "$NEW_VERSION" ] && [ "$OLD_PATH" = "$TARGET_PATH" ]; then
-                echo "❌ Error: Detected file changes for id '$ITEM_IDENTIFIER' without a version change."
-                
-                rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-                
-                exit 1
-              fi
-
-              if [ "$HAS_PREVIOUS" = 'true' ]; then
-                COMMIT_MESSAGE="chore(deps): bump $ITEM_IDENTIFIER from $OLD_VERSION to $NEW_VERSION"
-              else
-                COMMIT_MESSAGE="chore(deps): add $ITEM_IDENTIFIER $NEW_VERSION"
-              fi
-
-              git commit -m "$COMMIT_MESSAGE"
+              git commit -m "chore(deps): remove $ORPHANED_IDENTIFIER $ORPHANED_VERSION"
               COMMITS_CREATED=$((COMMITS_CREATED + 1))
-            
-            done < <(echo "$SOURCE_CONFIG" | jq -c '.dependencies[]')
-            rm -f "$SHARED_CONFIG_TEMPORARY_FILE"
-          done < <(echo "$SOURCES_JSON" | jq -c '.[]')
+              echo "🧹 Removed orphaned dependency $ORPHANED_IDENTIFIER@$ORPHANED_VERSION."
+            done < <(echo "$ORPHANED_DEPENDENCY_IDS" | jq -r '.[]')
+
+          else
+            echo "⏳ Skipping orphan cleanup because the dependency graph could not be resolved completely."
+
+            if [ "$LOCK_REBUILD_REQUIRED" = 'true' ]; then
+              echo "❌ Error: Cannot rebuild the lock file from an incomplete dependency graph."
+              exit 1
+            fi
+          fi
+
+          if [ "$LOCK_REBUILD_REQUIRED" = 'true' ]; then
+            LOCK_TEMPORARY_FILE=$(mktemp)
+
+            if ! jq '
+              with_entries(
+                .value = {
+                  shared_repo: .value.shared_repo,
+                  version: .value.version,
+                  path: .value.path
+                }
+              )
+            ' "$RESOLVED_DEPENDENCIES_FILE" > "$LOCK_TEMPORARY_FILE"; then
+              echo "❌ Error: Failed to generate the rebuilt lock file."
+              rm -f "$LOCK_TEMPORARY_FILE"
+              exit 1
+            fi
+
+            mv "$LOCK_TEMPORARY_FILE" "$LOCK_FILE"
+            git add -- "$LOCK_FILE"
+
+            if ! git diff --cached --quiet -- "$LOCK_FILE"; then
+              git commit -m 'ci(vendor-sync): rebuild lock file'
+              COMMITS_CREATED=$((COMMITS_CREATED + 1))
+              echo "🔄 Rebuilt $LOCK_FILE using the required dependency entry structure."
+            fi
+          fi
+
+          PREVIOUS_SHARED_REPOSITORIES=$(jq -c '[.[] | .shared_repo] | unique' "$INITIAL_LOCK_FILE")
+          REACHABLE_SHARED_REPOSITORIES=$(jq -c 'unique' "$REACHABLE_SHARED_REPOSITORIES_FILE")
+
+          echo "previous_shared_repositories=$PREVIOUS_SHARED_REPOSITORIES" >> "$GITHUB_OUTPUT"
+          echo "reachable_shared_repositories=$REACHABLE_SHARED_REPOSITORIES" >> "$GITHUB_OUTPUT"
+          echo "dependency_graph_complete=$DEPENDENCY_GRAPH_COMPLETE" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$TARGET_SHARED_REPOSITORY" ] && [ "$TARGET_REPOSITORY_MATCHED" != 'true' ]; then
+            echo "✅ No direct or transitive dependency found for targeted repository $TARGET_SHARED_REPOSITORY."
+
+            if [ "$COMMITS_CREATED" -eq 0 ]; then
+              exit 0
+            fi
+          fi
 
           if [ "$COMMITS_CREATED" -gt 0 ]; then
             echo "🚀 Pushing $COMMITS_CREATED dependency commit(s) to develop."

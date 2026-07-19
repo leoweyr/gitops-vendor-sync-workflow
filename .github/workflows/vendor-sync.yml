@@ -11,32 +11,23 @@ on:
 
 
 jobs:
+  call_vendor_sync:
+    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-sync.yml@develop
+    with:
+      vendor_config: 'gitops-vendor.json'
+      target_shared_repository: ${{ github.event.client_payload.shared_repository || '' }}
+    secrets:
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+
   sync_subscription:
-    if: ${{ github.event_name == 'push' }}
+    needs:
+      - call_vendor_sync
     uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-subscription-sync.yml@develop
     with:
-      vendor_config: 'gitops-vendor.json'
-      before_sha: ${{ github.event.before }}
+      previous_shared_repositories: ${{ needs.call_vendor_sync.outputs.previous_shared_repositories }}
+      reachable_shared_repositories: ${{ needs.call_vendor_sync.outputs.reachable_shared_repositories }}
+      dependency_graph_complete: ${{ needs.call_vendor_sync.outputs.dependency_graph_complete == 'true' }}
       subscribers_file: 'gitops-subscribers.json'
       target_branch: 'develop'
-    secrets:
-      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-
-  call_vendor_sync:
-    if: ${{ github.event_name == 'push' }}
-    needs:
-      - sync_subscription
-    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-sync.yml@develop
-    with:
-      vendor_config: 'gitops-vendor.json'
-    secrets:
-      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-
-  call_vendor_sync_from_dispatch:
-    if: ${{ github.event_name == 'repository_dispatch' }}
-    uses: leoweyr/gitops-vendor-sync-workflow/.github/workflows/reusable-vendor-sync.yml@develop
-    with:
-      vendor_config: 'gitops-vendor.json'
-      target_shared_repository: ${{ github.event.client_payload.shared_repository }}
     secrets:
       ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
