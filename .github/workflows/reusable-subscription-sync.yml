@@ -4,15 +4,18 @@ name: Reusable Subscription Source Sync Engine
 on:
   workflow_call:
     inputs:
-      vendor_config:
-        description: 'Path to the consumer repository vendor configuration.'
-        required: false
-        type: string
-        default: 'gitops-vendor.json'
-      before_sha:
-        description: 'Commit SHA from before the current push event.'
+      previous_shared_repositories:
+        description: 'JSON array of shared repositories tracked before dependency synchronization.'
         required: true
         type: string
+      reachable_shared_repositories:
+        description: 'JSON array of shared repositories reachable from the current dependency graph.'
+        required: true
+        type: string
+      dependency_graph_complete:
+        description: 'Whether the complete dependency graph resolved successfully.'
+        required: true
+        type: boolean
       subscribers_file:
         description: 'Path to the consumer repository list file in the shared code repository.'
         required: false
@@ -33,78 +36,74 @@ jobs:
   detect_shared_repo_change:
     runs-on: ubuntu-latest
     outputs:
-      has_removed: ${{ steps.detect.outputs.has_removed }}
-      has_added: ${{ steps.detect.outputs.has_added }}
-      removed_repos: ${{ steps.detect.outputs.removed_repos }}
-      added_repos: ${{ steps.detect.outputs.added_repos }}
+      has_removed: ${{ steps.calculate_subscription_changes_step.outputs.has_removed }}
+      has_added: ${{ steps.calculate_subscription_changes_step.outputs.has_added }}
+      removed_repos: ${{ steps.calculate_subscription_changes_step.outputs.removed_repos }}
+      added_repos: ${{ steps.calculate_subscription_changes_step.outputs.added_repos }}
     steps:
       - name: 👣 Track Workflow Run
         continue-on-error: true
         run: |
           curl -s "https://abacus.jasoncameron.dev/hit/leoweyr/gitops-vendor-sync-workflow-usage" > /dev/null
 
-      - name: '📥 Checkout Consumer Repository'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: '🔍 Detect Shared Repository Change'
-        id: detect
+      - name: '🔍 Calculate Subscription Changes'
+        id: calculate_subscription_changes_step
         env:
-          VENDOR_CONFIG: ${{ inputs.vendor_config }}
-          BEFORE_SHA: ${{ inputs.before_sha }}
+          PREVIOUS_SHARED_REPOSITORIES: ${{ inputs.previous_shared_repositories }}
+          REACHABLE_SHARED_REPOSITORIES: ${{ inputs.reachable_shared_repositories }}
+          DEPENDENCY_GRAPH_COMPLETE: ${{ inputs.dependency_graph_complete }}
         run: |
-          # Parse current and previous repos, supporting both single object and array formats.
-          OLD_REPOS_JSON=$(if [ -n "$BEFORE_SHA" ] && git cat-file -e "$BEFORE_SHA:$VENDOR_CONFIG" 2>/dev/null; then
-            git show "$BEFORE_SHA:$VENDOR_CONFIG" | jq -c 'if type == "array" then [.[].shared_repo] else [.shared_repo // .upstream_repo] end | map(select(. != null))'
-          else
-            echo '[]'
-          fi)
-          
-          NEW_REPOS_JSON=$(jq -c 'if type == "array" then [.[].shared_repo] else [.shared_repo // .upstream_repo] end | map(select(. != null))' "$VENDOR_CONFIG")
+          validate_repository_set() {
+            local repositories="$1"
 
-          REMOVED_REPOS=$(jq -nc --argjson old "$OLD_REPOS_JSON" --argjson new "$NEW_REPOS_JSON" '$old - $new')
-          ADDED_REPOS=$(jq -nc --argjson old "$OLD_REPOS_JSON" --argjson new "$NEW_REPOS_JSON" '$new - $old')
+            echo "$repositories" | jq -e '
+              type == "array" and
+              all(.[];
+                type == "string" and
+                test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+              )
+            ' >/dev/null
+          }
 
-          echo "removed_repos=$REMOVED_REPOS" >> "$GITHUB_OUTPUT"
-          echo "added_repos=$ADDED_REPOS" >> "$GITHUB_OUTPUT"
-          
-          if [ "$(echo "$REMOVED_REPOS" | jq 'length')" -gt 0 ]; then
-            echo "has_removed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_removed=false" >> "$GITHUB_OUTPUT"
+          if ! validate_repository_set "$PREVIOUS_SHARED_REPOSITORIES"; then
+            echo "❌ Error: Previous shared repositories must be a JSON array of owner/repo strings."
+            exit 1
           fi
 
-          if [ "$(echo "$ADDED_REPOS" | jq 'length')" -gt 0 ]; then
+          if ! validate_repository_set "$REACHABLE_SHARED_REPOSITORIES"; then
+            echo "❌ Error: Reachable shared repositories must be a JSON array of owner/repo strings."
+            exit 1
+          fi
+
+          ADDED_REPOSITORIES=$(jq -nc \
+            --argjson previous "$PREVIOUS_SHARED_REPOSITORIES" \
+            --argjson reachable "$REACHABLE_SHARED_REPOSITORIES" \
+            '($reachable | unique) - ($previous | unique)')
+
+          if [ "$DEPENDENCY_GRAPH_COMPLETE" = 'true' ]; then
+            REMOVED_REPOSITORIES=$(jq -nc \
+              --argjson previous "$PREVIOUS_SHARED_REPOSITORIES" \
+              --argjson reachable "$REACHABLE_SHARED_REPOSITORIES" \
+              '($previous | unique) - ($reachable | unique)')
+          else
+            REMOVED_REPOSITORIES='[]'
+            echo "👻 Skipping repository unsubscription because the dependency graph did not resolve completely."
+          fi
+
+          echo "added_repos=$ADDED_REPOSITORIES" >> "$GITHUB_OUTPUT"
+          echo "removed_repos=$REMOVED_REPOSITORIES" >> "$GITHUB_OUTPUT"
+
+          if [ "$(echo "$ADDED_REPOSITORIES" | jq 'length')" -gt 0 ]; then
             echo "has_added=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_added=false" >> "$GITHUB_OUTPUT"
           fi
 
-  remove_subscriber_from_old_shared_repos:
-    if: ${{ needs.detect_shared_repo_change.outputs.has_removed == 'true' }}
-    needs:
-      - detect_shared_repo_change
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        repo: ${{ fromJson(needs.detect_shared_repo_change.outputs.removed_repos) }}
-    steps:
-      - name: '🛠️ Dispatch Unsubscribe Request'
-        env:
-          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          TARGET_SHARED_REPO: ${{ matrix.repo }}
-          SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
-          TARGET_BRANCH: ${{ inputs.target_branch }}
-        run: |
-          gh api --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/$TARGET_SHARED_REPO/actions/workflows/vendor-broadcast.yml/dispatches" \
-            -f ref="$TARGET_BRANCH" \
-            -f "inputs[subscriber_action]=remove" \
-            -f "inputs[subscriber_repository]=${{ github.repository }}" \
-            -f "inputs[subscribers_file]=$SUBSCRIBERS_FILE" \
-            -f "inputs[target_branch]=$TARGET_BRANCH"
+          if [ "$(echo "$REMOVED_REPOSITORIES" | jq 'length')" -gt 0 ]; then
+            echo "has_removed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_removed=false" >> "$GITHUB_OUTPUT"
+          fi
 
   add_subscriber_to_new_shared_repos:
     if: ${{ needs.detect_shared_repo_change.outputs.has_added == 'true' }}
@@ -115,18 +114,58 @@ jobs:
       matrix:
         repo: ${{ fromJson(needs.detect_shared_repo_change.outputs.added_repos) }}
     steps:
-      - name: '🛠️ Dispatch Subscribe Request'
+      - name: '📫 Subscribe to Newly Reachable Repositories'
         env:
           GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          TARGET_SHARED_REPO: ${{ matrix.repo }}
+          CONSUMER_REPOSITORY: ${{ github.repository }}
           SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
+          TARGET_SHARED_REPOSITORY: ${{ matrix.repo }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
-          gh api --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/$TARGET_SHARED_REPO/actions/workflows/vendor-broadcast.yml/dispatches" \
+          if ! gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/$TARGET_SHARED_REPOSITORY/actions/workflows/vendor-broadcast.yml/dispatches" \
             -f ref="$TARGET_BRANCH" \
-            -f "inputs[subscriber_action]=add" \
-            -f "inputs[subscriber_repository]=${{ github.repository }}" \
+            -f 'inputs[subscriber_action]=add' \
+            -f "inputs[subscriber_repository]=$CONSUMER_REPOSITORY" \
             -f "inputs[subscribers_file]=$SUBSCRIBERS_FILE" \
-            -f "inputs[target_branch]=$TARGET_BRANCH"
+            -f "inputs[target_branch]=$TARGET_BRANCH" \
+            >/dev/null; then
+            echo "❌ Error: Failed to subscribe $CONSUMER_REPOSITORY to $TARGET_SHARED_REPOSITORY."
+            exit 1
+          fi
+
+          echo "✅ Subscribed $CONSUMER_REPOSITORY to $TARGET_SHARED_REPOSITORY."
+
+  remove_subscriber_from_old_shared_repos:
+    if: ${{ always() && needs.detect_shared_repo_change.result == 'success' && needs.detect_shared_repo_change.outputs.has_removed == 'true' && (needs.add_subscriber_to_new_shared_repos.result == 'success' || needs.add_subscriber_to_new_shared_repos.result == 'skipped') }}
+    needs:
+      - detect_shared_repo_change
+      - add_subscriber_to_new_shared_repos
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: ${{ fromJson(needs.detect_shared_repo_change.outputs.removed_repos) }}
+    steps:
+      - name: '📫 Unsubscribe From Orphaned Repositories'
+        env:
+          GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          CONSUMER_REPOSITORY: ${{ github.repository }}
+          SUBSCRIBERS_FILE: ${{ inputs.subscribers_file }}
+          TARGET_SHARED_REPOSITORY: ${{ matrix.repo }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          if ! gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/$TARGET_SHARED_REPOSITORY/actions/workflows/vendor-broadcast.yml/dispatches" \
+            -f ref="$TARGET_BRANCH" \
+            -f 'inputs[subscriber_action]=remove' \
+            -f "inputs[subscriber_repository]=$CONSUMER_REPOSITORY" \
+            -f "inputs[subscribers_file]=$SUBSCRIBERS_FILE" \
+            -f "inputs[target_branch]=$TARGET_BRANCH" \
+            >/dev/null; then
+            echo "❌ Error: Failed to unsubscribe $CONSUMER_REPOSITORY from $TARGET_SHARED_REPOSITORY."
+            exit 1
+          fi
+
+          echo "✅ Unsubscribed $CONSUMER_REPOSITORY from orphaned repository $TARGET_SHARED_REPOSITORY."

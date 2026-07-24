@@ -61,6 +61,22 @@ jobs:
             exit 1
           fi
 
+          if ! jq -e '
+            all(.[];
+              ((.dependencies // []) | type == "array") and
+              (
+                if ((.versions // null) | type) == "array" then
+                  all(.versions[]; ((.dependencies // []) | type == "array"))
+                else
+                  true
+                end
+              )
+            )
+          ' "$CONFIG_FILE" >/dev/null; then
+            echo "❌ Error: Shared manifest dependencies must be JSON arrays."
+            exit 1
+          fi
+
           SHARED_TAG="${SHARED_TAG_INPUT#refs/tags/}"
           
           if ! [[ "$SHARED_TAG" =~ ^shared/([^/]+)/v(.+)$ ]]; then
@@ -125,30 +141,50 @@ jobs:
                 .
               else
                 if ((.versions // null) | type) == "array" then
-                  (
-                    . + {
+                  . as $item
+                  | (($item.versions | last | .default_target_dir) // "") as $default_target_dir
+                  | (($item.versions | last | .dependencies) // []) as $dependencies
+                  | (
+                    $item + {
                       versions: (
-                        .versions + [
-                          ({ version: $version, source: $source } + (if $ref != "" then { ref: $ref } else {} end))
+                        $item.versions + [
+                          (
+                            { version: $version, source: $source }
+                            + (if $ref != "" then { ref: $ref } else {} end)
+                            + (if $default_target_dir != "" then { default_target_dir: $default_target_dir } else {} end)
+                            + (if ($dependencies | length) > 0 then { dependencies: $dependencies } else {} end)
+                          )
                         ]
                       )
                     }
                   )
-                  | del(.version, .source, .ref)
+                  | del(.version, .source, .ref, .default_target_dir, .dependencies)
                 else
                   . as $item
+                  | (($item.default_target_dir) // "") as $default_target_dir
+                  | (($item.dependencies) // []) as $dependencies
                   | (
                       $item + {
                         versions: (
                           [
-                            ({ version: ($item.version // empty), source: ($item.source // empty) } + (if ($item.ref // "") != "" then { ref: $item.ref } else {} end)),
-                            ({ version: $version, source: $source } + (if $ref != "" then { ref: $ref } else {} end))
+                            (
+                              { version: ($item.version // empty), source: ($item.source // empty) }
+                              + (if ($item.ref // "") != "" then { ref: $item.ref } else {} end)
+                              + (if $default_target_dir != "" then { default_target_dir: $default_target_dir } else {} end)
+                              + (if ($dependencies | length) > 0 then { dependencies: $dependencies } else {} end)
+                            ),
+                            (
+                              { version: $version, source: $source }
+                              + (if $ref != "" then { ref: $ref } else {} end)
+                              + (if $default_target_dir != "" then { default_target_dir: $default_target_dir } else {} end)
+                              + (if ($dependencies | length) > 0 then { dependencies: $dependencies } else {} end)
+                            )
                           ]
                           | map(select(.version != "" and .source != ""))
                         )
                       }
                     )
-                  | del(.version, .source, .ref)
+                  | del(.version, .source, .ref, .default_target_dir, .dependencies)
                 end
               end
             )
@@ -225,30 +261,50 @@ jobs:
                   .
                 else
                   if ((.versions // null) | type) == "array" then
-                    (
-                      . + {
+                    . as $item
+                    | (($item.versions | last | .default_target_dir) // "") as $default_target_dir
+                    | (($item.versions | last | .dependencies) // []) as $dependencies
+                    | (
+                      $item + {
                         versions: (
-                          .versions + [
-                            ({ version: $version, source: $source } + (if $ref != "" then { ref: $ref } else {} end))
+                          $item.versions + [
+                            (
+                              { version: $version, source: $source }
+                              + (if $ref != "" then { ref: $ref } else {} end)
+                              + (if $default_target_dir != "" then { default_target_dir: $default_target_dir } else {} end)
+                              + (if ($dependencies | length) > 0 then { dependencies: $dependencies } else {} end)
+                            )
                           ]
                         )
                       }
                     )
-                    | del(.version, .source, .ref)
+                    | del(.version, .source, .ref, .default_target_dir, .dependencies)
                   else
                     . as $item
+                    | (($item.default_target_dir) // "") as $default_target_dir
+                    | (($item.dependencies) // []) as $dependencies
                     | (
                         $item + {
                           versions: (
                             [
-                              ({ version: ($item.version // empty), source: ($item.source // empty) } + (if ($item.ref // "") != "" then { ref: $item.ref } else {} end)),
-                              ({ version: $version, source: $source } + (if $ref != "" then { ref: $ref } else {} end))
+                              (
+                                { version: ($item.version // empty), source: ($item.source // empty) }
+                                + (if ($item.ref // "") != "" then { ref: $item.ref } else {} end)
+                                + (if $default_target_dir != "" then { default_target_dir: $default_target_dir } else {} end)
+                                + (if ($dependencies | length) > 0 then { dependencies: $dependencies } else {} end)
+                              ),
+                              (
+                                { version: $version, source: $source }
+                                + (if $ref != "" then { ref: $ref } else {} end)
+                                + (if $default_target_dir != "" then { default_target_dir: $default_target_dir } else {} end)
+                                + (if ($dependencies | length) > 0 then { dependencies: $dependencies } else {} end)
+                              )
                             ]
                             | map(select(.version != "" and .source != ""))
                           )
                         }
                       )
-                    | del(.version, .source, .ref)
+                    | del(.version, .source, .ref, .default_target_dir, .dependencies)
                   end
                 end
               )
