@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+# [2.0.0](https://github.com/leoweyr/gitops-vendor-sync-workflow/compare/v1.1.0...v2.0.0) (2026-07-22)
+### Features
+
+* support setting default target directories for vendor broadcasts ([fd2273c](https://github.com/leoweyr/gitops-vendor-sync-workflow/commit/fd2273c767d6634eb04acc905acca15deb6ee835)) [@leoweyr](https://github.com/leoweyr)
+* resolve and subscribe to transitive vendor dependencies ([2370b42](https://github.com/leoweyr/gitops-vendor-sync-workflow/commit/2370b427f320157e47a6f480dcac2f235bd0bca5)) [@leoweyr](https://github.com/leoweyr)
+
+
+
 # [1.1.0](https://github.com/leoweyr/gitops-vendor-sync-workflow/compare/v1.0.2...v1.1.0) (2026-05-27)
 ### Features
 
